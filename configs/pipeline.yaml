@@ -1,0 +1,15 @@
+pipeline:
+  detector: megadetector_v6
+  detector_version: MDV6-yolov9-c
+  tracker: bytetrack
+  species_classifier: speciesnet
+  behavior_model: resnet18_lstm
+  sample_every: 3
+  behavior_sequence_length: 16
+  confidence_threshold: 0.25
+behavior:
+  classes: [RESTING, NORMAL_MOVEMENT, RUNNING, CHASING, AGGRESSIVE/ABNORMAL, UNKNOWN]
+risk:
+  levels: [LOW, MEDIUM, HIGH, CRITICAL, UNKNOWN]
+  require_evidence: true
+  unknown_is_not_low: true
