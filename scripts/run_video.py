@@ -38,19 +38,14 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
-def _upscale_for_detection(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
+def _upscale_for_detection(frame: np.ndarray, target_size: int = DETECTOR_INPUT_SIZE) -> tuple[np.ndarray, float, float]:
     """Upscale small frames for detection and return x/y scale factors."""
     height, width = frame.shape[:2]
-    if max(width, height) >= DETECTOR_INPUT_SIZE:
+    if max(width, height) >= target_size:
         return frame, 1.0, 1.0
-
-    scale_x = DETECTOR_INPUT_SIZE / width
-    scale_y = DETECTOR_INPUT_SIZE / height
-    resized = cv2.resize(
-        frame,
-        (DETECTOR_INPUT_SIZE, DETECTOR_INPUT_SIZE),
-        interpolation=cv2.INTER_CUBIC,
-    )
+    scale_x = target_size / max(width, 1)
+    scale_y = target_size / max(height, 1)
+    resized = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
     return resized, scale_x, scale_y
 
 
@@ -76,7 +71,7 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
 
     detector = MegaDetectorAdapter(DetectorConfig(confidence=confidence, device="cpu"))
     detector.load()
-    tracker = ByteTrackAdapter()
+    tracker = ByteTrackAdapter(track_thresh=confidence)
     tracker.load()
 
     detection_rows: list[dict[str, Any]] = []
@@ -92,30 +87,37 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
 
             if frame_index % max(1, sample_every) == 0:
                 sampled_frames += 1
-
                 detection_frame, scale_x, scale_y = _upscale_for_detection(frame)
                 rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
                 result = detector.model.single_image_detection(rgb, det_conf_thres=confidence)
                 detections = _detections_from_result(result)
 
-                # Convert detector boxes back to the original video resolution.
+                # Convert detector boxes back to source-video coordinates before tracking/storage.
                 if len(detections) > 0 and (scale_x != 1.0 or scale_y != 1.0):
                     detections.xyxy[:, [0, 2]] /= scale_x
                     detections.xyxy[:, [1, 3]] /= scale_y
 
-                # ByteTrack expects xyxy + confidence + class_id.
                 tracked = tracker.update(detections)
                 tracker_ids = tracked.tracker_id
-                class_ids = tracked.class_id
-                confidences = tracked.confidence
-                boxes = tracked.xyxy
 
-                for i, box in enumerate(boxes):
-                    cls_id = int(class_ids[i]) if class_ids is not None else -1
-                    score = float(confidences[i]) if confidences is not None else 0.0
+                raw_boxes = detections.xyxy
+                raw_class_ids = detections.class_id
+                raw_confidences = detections.confidence
+
+                # Build rows from RAW detector output, not only from ByteTrack output.
+                # This prevents a short-lived detector hit from disappearing when
+                # ByteTrack has not assigned an ID yet.
+                for i, box in enumerate(raw_boxes):
+                    cls_id = int(raw_class_ids[i]) if raw_class_ids is not None else -1
+                    score = float(raw_confidences[i]) if raw_confidences is not None else 0.0
                     track_id = None
-                    if tracker_ids is not None and tracker_ids[i] is not None:
+                    tracked_flag = False
+                    if tracker_ids is not None and i < len(tracker_ids) and tracker_ids[i] is not None:
                         track_id = str(int(tracker_ids[i]))
+                        tracked_flag = True
+                    else:
+                        track_id = f"det_{frame_index}_{i}"
+
                     x1, y1, x2, y2 = [float(v) for v in box]
                     row = {
                         "frame_index": frame_index,
@@ -125,15 +127,15 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
                         "confidence": score,
                         "bbox": [x1, y1, x2, y2],
                         "track_id": track_id,
+                        "tracked": tracked_flag,
                     }
                     detection_rows.append(row)
-                    if track_id is not None:
-                        track_rows.append(row.copy())
+                    track_rows.append(row.copy())
 
                     p1 = (int(x1), int(y1))
                     p2 = (int(x2), int(y2))
                     cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
-                    label = f"#{track_id or '-'} {row['class_name']} {score:.2f}"
+                    label = f"#{track_id} {row['class_name']} {score:.2f}"
                     cv2.putText(frame, label, (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
             writer.write(frame)
