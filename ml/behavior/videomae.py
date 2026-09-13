@@ -47,17 +47,11 @@ class VideoMAEBehaviorClassifier:
 
         self.processor = VideoMAEImageProcessor.from_pretrained(self.BASE_MODEL)
         self.model = VideoMAEForVideoClassification(config)
+
+        # The local checkpoint already uses the q_bias/v_bias naming expected
+        # by the installed Transformers VideoMAE implementation. Do not rename
+        # those tensors into query/key/value bias fields.
         state = dict(checkpoint["model_state"])
-        # Original VideoMAE checkpoints store Q/V biases separately; current
-        # Transformers expects separate query/key/value bias tensors.
-        for i in range(12):
-            prefix = f"videomae.encoder.layer.{i}.attention.attention"
-            q = state.pop(f"{prefix}.q_bias", None)
-            v = state.pop(f"{prefix}.v_bias", None)
-            if q is not None and v is not None:
-                state[f"{prefix}.query.bias"] = q
-                state[f"{prefix}.key.bias"] = torch.zeros_like(q)
-                state[f"{prefix}.value.bias"] = v
         self.model.load_state_dict(state, strict=True)
         self.model.to(self.device).eval()
 
