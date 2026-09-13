@@ -24,17 +24,11 @@ def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
     candidates: list[tuple[str, float]] = []
-
     for row in rows:
         prediction = row.get("prediction")
         if isinstance(prediction, str) and prediction.strip():
             parts = [p.strip() for p in prediction.split(";")]
-            if len(parts) >= 7 and parts[-1]:
-                name = parts[-1]
-            elif len(parts) >= 6 and parts[-2]:
-                name = parts[-2]
-            else:
-                name = prediction.strip()
+            name = parts[-1] if len(parts) >= 7 and parts[-1] else (parts[-2] if len(parts) >= 6 and parts[-2] else prediction.strip())
             try:
                 score = float(row.get("prediction_score", 0.0))
             except (TypeError, ValueError):
@@ -45,12 +39,7 @@ def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
             value = row.get(key)
             if isinstance(value, str) and value.strip():
                 try:
-                    score = float(
-                        row.get(
-                            "prediction_score",
-                            row.get("score", row.get("confidence", row.get("probability", 0.0))),
-                        )
-                    )
+                    score = float(row.get("prediction_score", row.get("score", row.get("confidence", row.get("probability", 0.0)))))
                 except (TypeError, ValueError):
                     score = 0.0
                 candidates.append((value.strip(), score))
@@ -58,20 +47,10 @@ def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
         for key in ("classification", "classifications"):
             value = row.get(key)
             if isinstance(value, dict):
-                name = (
-                    value.get("common_name")
-                    or value.get("species")
-                    or value.get("label")
-                    or value.get("class")
-                )
+                name = value.get("common_name") or value.get("species") or value.get("label") or value.get("class")
                 if isinstance(name, str) and name.strip():
                     try:
-                        score = float(
-                            value.get(
-                                "prediction_score",
-                                value.get("score", value.get("confidence", value.get("probability", 0.0))),
-                            )
-                        )
+                        score = float(value.get("prediction_score", value.get("score", value.get("confidence", value.get("probability", 0.0)))))
                     except (TypeError, ValueError):
                         score = 0.0
                     candidates.append((name.strip(), score))
@@ -81,9 +60,21 @@ def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
 
 def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Path, per_track: int = 16) -> dict[str, list[Path]]:
     by_track: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    untracked_animals: list[dict[str, Any]] = []
+
     for row in tracks:
-        if row.get("track_id") is not None and row.get("class_name") == "animal":
+        if row.get("class_name") != "animal":
+            continue
+        if row.get("track_id") is not None:
             by_track[str(row["track_id"])].append(row)
+        else:
+            untracked_animals.append(row)
+
+    # ByteTrack can legitimately have a missing ID on the first/short-lived
+    # detections. Keep those frames as one fallback sequence so SpeciesNet still
+    # receives animal crops instead of silently producing an empty predictions file.
+    if untracked_animals and not by_track:
+        by_track["untracked_animal"] = untracked_animals
 
     selected: dict[str, list[dict[str, Any]]] = {}
     for tid, rows in by_track.items():
@@ -110,8 +101,8 @@ def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Pa
                 continue
             path = crop_root / f"track_{tid}" / f"frame_{frame_index:08d}.jpg"
             path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(path), frame[y1:y2, x1:x2])
-            out[tid].append(path)
+            if cv2.imwrite(str(path), frame[y1:y2, x1:x2]):
+                out[tid].append(path)
         if selected and len(out) == len(selected) and all(len(out[k]) == len(selected[k]) for k in selected):
             break
     return dict(out)
@@ -173,11 +164,7 @@ def run_integrated(
             if not isinstance(raw, str):
                 continue
             raw_path = Path(raw)
-            raw_candidates = {
-                str(raw_path.resolve()).lower(),
-                str(raw_path).lower(),
-                raw_path.name.lower(),
-            }
+            raw_candidates = {str(raw_path.resolve()).lower(), str(raw_path).lower(), raw_path.name.lower()}
             if raw_candidates & path_set or raw_path.name.lower() in path_names:
                 matching.append(r)
         species, confidence = _best_species(matching)
@@ -208,46 +195,21 @@ def run_integrated(
 
         evidence_conf = min(float(info["confidence"]), float(behavior_result["confidence"]))
         risk = score_risk(RiskInput(
-            species=info["species"],
-            behaviour=behavior_result["behaviour"],
-            human_present=humans_present,
-            distance_m=None,
-            persistence_s=0.0,
-            detector_confidence=1.0,
-            behaviour_confidence=float(behavior_result["confidence"]),
-            confidence=evidence_conf,
+            species=info["species"], behaviour=behavior_result["behaviour"], human_present=humans_present,
+            distance_m=None, persistence_s=0.0, detector_confidence=1.0,
+            behaviour_confidence=float(behavior_result["confidence"]), confidence=evidence_conf,
         ))
         risk_events.append({
-            "risk_event_id": str(uuid.uuid4()),
-            "track_id": tid,
-            "species": info["species"],
-            "behaviour": behavior_result["behaviour"],
-            "behaviour_confidence": behavior_result["confidence"],
-            "human_present": humans_present,
-            "risk": risk,
-            "evidence_uri": evidence_uri,
+            "risk_event_id": str(uuid.uuid4()), "track_id": tid, "species": info["species"],
+            "behaviour": behavior_result["behaviour"], "behaviour_confidence": behavior_result["confidence"],
+            "human_present": humans_present, "risk": risk, "evidence_uri": evidence_uri,
         })
 
     result = {
-        "input": str(video),
-        "summary": summary,
-        "species": track_species,
-        "behavior": behavior_results,
+        "input": str(video), "summary": summary, "species": track_species, "behavior": behavior_results,
         "risk_events": risk_events,
-        "models": {
-            "detector": "MegaDetectorV6 MDV6-yolov9-c",
-            "tracker": "ByteTrack",
-            "species": "SpeciesNet 5.x",
-            "behavior": "VideoMAE-CattleVision-v1",
-            "device": "cpu",
-        },
-        "outputs": {
-            "annotated_video": str(video_dir / "annotated.mp4"),
-            "tracks": str(video_dir / "tracks.json"),
-            "species": str(species_json),
-            "crops": str(crop_root),
-            "evidence": evidence_uri,
-        },
+        "models": {"detector": "MegaDetectorV6 MDV6-yolov9-c", "tracker": "ByteTrack", "species": "SpeciesNet 5.x", "behavior": "VideoMAE-CattleVision-v1", "device": "cpu"},
+        "outputs": {"annotated_video": str(video_dir / "annotated.mp4"), "tracks": str(video_dir / "tracks.json"), "species": str(species_json), "crops": str(crop_root), "evidence": evidence_uri},
     }
     (output_dir / "pipeline.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
