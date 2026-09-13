@@ -49,6 +49,63 @@ def _upscale_for_detection(frame: np.ndarray, target_size: int = DETECTOR_INPUT_
     return resized, scale_x, scale_y
 
 
+def _box_iou_one_to_many(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    """Compute IoU between one xyxy box and an array of xyxy boxes."""
+    if boxes.size == 0:
+        return np.empty((0,), dtype=float)
+    x1 = np.maximum(box[0], boxes[:, 0])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    x2 = np.minimum(box[2], boxes[:, 2])
+    y2 = np.minimum(box[3], boxes[:, 3])
+    inter_w = np.maximum(0.0, x2 - x1)
+    inter_h = np.maximum(0.0, y2 - y1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, float(box[2] - box[0])) * max(0.0, float(box[3] - box[1]))
+    area_b = np.maximum(0.0, boxes[:, 2] - boxes[:, 0]) * np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+    union = area_a + area_b - inter
+    return np.divide(inter, np.maximum(union, 1e-9))
+
+
+def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) -> dict[int, int]:
+    """Map tracker IDs back to raw detector indices by geometry, not array position.
+
+    Supervision may filter detections before returning tracked results. Indexing
+    tracked.tracker_id with the raw-detection index can therefore assign a
+    person's track ID to an animal box (or vice versa). Match the tracked boxes
+    back to the original detector boxes using class-aware IoU.
+    """
+    mapping: dict[int, int] = {}
+    if len(raw) == 0 or len(tracked) == 0 or tracked.tracker_id is None:
+        return mapping
+
+    raw_boxes = np.asarray(raw.xyxy, dtype=float)
+    tracked_boxes = np.asarray(tracked.xyxy, dtype=float)
+    raw_classes = np.asarray(raw.class_id) if raw.class_id is not None else None
+    tracked_classes = np.asarray(tracked.class_id) if tracked.class_id is not None else None
+    used_raw: set[int] = set()
+
+    candidates: list[tuple[float, int, int, int]] = []
+    for tracked_idx, tracked_box in enumerate(tracked_boxes):
+        tracker_value = tracked.tracker_id[tracked_idx]
+        if tracker_value is None:
+            continue
+        ious = _box_iou_one_to_many(tracked_box, raw_boxes)
+        for raw_idx, iou in enumerate(ious):
+            if raw_idx in used_raw:
+                continue
+            if raw_classes is not None and tracked_classes is not None and raw_classes[raw_idx] != tracked_classes[tracked_idx]:
+                continue
+            candidates.append((float(iou), int(tracked_idx), int(raw_idx), int(tracker_value)))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for iou, _tracked_idx, raw_idx, tracker_value in candidates:
+        if iou < 0.50 or raw_idx in used_raw:
+            continue
+        mapping[raw_idx] = tracker_value
+        used_raw.add(raw_idx)
+    return mapping
+
+
 def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confidence: float = DEFAULT_CONFIDENCE) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     annotated_path = output_dir / "annotated.mp4"
@@ -98,25 +155,21 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
                     detections.xyxy[:, [1, 3]] /= scale_y
 
                 tracked = tracker.update(detections)
-                tracker_ids = tracked.tracker_id
+                tracker_map = _tracker_ids_for_raw_detections(detections, tracked)
 
                 raw_boxes = detections.xyxy
                 raw_class_ids = detections.class_id
                 raw_confidences = detections.confidence
 
-                # Build rows from RAW detector output, not only from ByteTrack output.
-                # This prevents a short-lived detector hit from disappearing when
-                # ByteTrack has not assigned an ID yet.
+                # Build rows from RAW detector output. Tracker IDs are attached
+                # to raw detections only after an explicit IoU/class match.
+                # Unmatched detections receive a deterministic fallback ID.
                 for i, box in enumerate(raw_boxes):
                     cls_id = int(raw_class_ids[i]) if raw_class_ids is not None else -1
                     score = float(raw_confidences[i]) if raw_confidences is not None else 0.0
-                    track_id = None
-                    tracked_flag = False
-                    if tracker_ids is not None and i < len(tracker_ids) and tracker_ids[i] is not None:
-                        track_id = str(int(tracker_ids[i]))
-                        tracked_flag = True
-                    else:
-                        track_id = f"det_{frame_index}_{i}"
+                    tracker_value = tracker_map.get(i)
+                    tracked_flag = tracker_value is not None
+                    track_id = str(tracker_value) if tracked_flag else f"det_{frame_index}_{i}"
 
                     x1, y1, x2, y2 = [float(v) for v in box]
                     row = {
