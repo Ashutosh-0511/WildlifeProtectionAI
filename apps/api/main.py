@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,14 @@ async def inference_video(file: UploadFile = File(...)):
             behavior_checkpoint=CHECKPOINT,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Pipeline failed: {type(exc).__name__}: {exc}") from exc
+        # Keep the browser response concise but always print the complete
+        # traceback to the Uvicorn console so pipeline failures can be fixed
+        # from the actual failing stage rather than a generic 500 response.
+        traceback.print_exc()
+        raise HTTPException(
+            500,
+            f"Pipeline failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
     # Convert local artifact paths into browser URLs.
     result["job_id"] = job_id
