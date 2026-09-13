@@ -235,8 +235,13 @@ def run_integrated(
 
     track_species = dict(sorted(track_species.items(), key=_species_priority, reverse=True))
 
-    from ml.behavior import BehaviorMapper, VideoMAEBehaviorClassifier
-    behavior_model = VideoMAEBehaviorClassifier(behavior_checkpoint, device="cpu")
+    # The public API of this function keeps behavior_checkpoint for backwards
+    # compatibility with the dashboard. Stage 1 uses the pretrained X3D-S
+    # backend and does not read the legacy VideoMAE checkpoint.
+    from ml.behavior import BehaviorMapper, X3DBehaviorClassifier
+    _ = behavior_checkpoint
+    behavior_model = X3DBehaviorClassifier(device="cpu")
+
     humans_present = any(r.get("class_name") == "person" for r in tracks)
     risk_events = []
     behavior_results: dict[str, dict[str, Any]] = {}
@@ -247,8 +252,8 @@ def run_integrated(
             behavior_result = BehaviorMapper.enrich(behavior_model.predict_paths(crops[tid]))
         else:
             behavior_result = {
-                "behaviour": "Other", "behavior_class": "UNKNOWN", "confidence": 0.0,
-                "frames": 0, "model_version": "VideoMAE-CattleVision-v1",
+                "behaviour": "UNKNOWN", "behavior_class": "UNKNOWN", "confidence": 0.0,
+                "frames": 0, "model_version": "X3D-S-Kinetics400-v1",
                 "reason": "no_track_crops",
             }
         behavior_results[tid] = behavior_result
@@ -268,7 +273,7 @@ def run_integrated(
     result = {
         "input": str(video), "summary": summary, "species": track_species, "behavior": behavior_results,
         "risk_events": risk_events,
-        "models": {"detector": "MegaDetectorV6 MDV6-yolov9-c", "tracker": "ByteTrack", "species": "SpeciesNet 5.x", "behavior": "VideoMAE-CattleVision-v1", "device": "cpu"},
+        "models": {"detector": "MegaDetectorV6 MDV6-yolov9-c", "tracker": "ByteTrack", "species": "SpeciesNet 5.x", "behavior": "X3D-S-Kinetics400-v1", "device": "cpu"},
         "outputs": {"annotated_video": str(video_dir / "annotated.mp4"), "tracks": str(video_dir / "tracks.json"), "species": str(species_json), "crops": str(crop_root), "evidence": evidence_uri},
     }
     (output_dir / "pipeline.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
