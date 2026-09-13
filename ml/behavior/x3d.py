@@ -74,7 +74,7 @@ class X3DBehaviorClassifier:
 
     def __init__(self, device: str = "cpu", label_cache: str | Path = "models/behavior/x3d") -> None:
         self.device = torch.device(device)
-        if self.device.type != "cpu'" and not torch.cuda.is_available():
+        if self.device.type != "cpu" and not torch.cuda.is_available():
             raise RuntimeError(f"Requested device {device!r}, but CUDA is unavailable.")
 
         self.cache_dir = Path(label_cache)
