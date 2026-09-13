@@ -16,6 +16,11 @@ from ml.tracking.bytetrack import ByteTrackAdapter
 DEFAULT_LABELS = {0: "animal", 1: "person", 2: "vehicle"}
 DETECTOR_INPUT_SIZE = 1280
 DEFAULT_CONFIDENCE = 0.10
+MAX_FALLBACK_STITCH_GAP = 6
+FALLBACK_IOU_THRESHOLD = 0.20
+FALLBACK_CENTER_THRESHOLD = 0.35
+FALLBACK_MIN_AREA_RATIO = 0.40
+FALLBACK_MAX_AREA_RATIO = 2.50
 
 
 def _detections_from_result(result: Any) -> sv.Detections:
@@ -66,14 +71,130 @@ def _box_iou_one_to_many(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     return np.divide(inter, np.maximum(union, 1e-9))
 
 
-def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) -> dict[int, int]:
-    """Map tracker IDs back to raw detector indices by geometry, not array position.
+def _box_iou(box_a: list[float], box_b: list[float]) -> float:
+    a = np.asarray(box_a, dtype=float)
+    b = np.asarray(box_b, dtype=float)
+    return float(_box_iou_one_to_many(a, b.reshape(1, 4))[0])
 
-    Supervision may filter detections before returning tracked results. Indexing
-    tracked.tracker_id with the raw-detection index can therefore assign a
-    person's track ID to an animal box (or vice versa). Match the tracked boxes
-    back to the original detector boxes using class-aware IoU.
+
+def _box_center(box: list[float]) -> tuple[float, float]:
+    return ((float(box[0]) + float(box[2])) * 0.5, (float(box[1]) + float(box[3])) * 0.5)
+
+
+def _box_area(box: list[float]) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+def _fallback_match_score(previous: dict[str, Any], current: dict[str, Any]) -> float | None:
+    """Return a conservative spatial continuity score for fallback detections.
+
+    Fallback detector IDs are created when ByteTrack does not return an ID for a
+    raw detection. We may reuse a recent track ID only when the boxes are
+    geometrically consistent. This avoids turning every one-frame detection into
+    a separate behavior track while refusing obviously different animals.
     """
+    if previous.get("class_name") != current.get("class_name"):
+        return None
+
+    gap = int(current["frame_index"]) - int(previous["frame_index"])
+    if gap <= 0 or gap > MAX_FALLBACK_STITCH_GAP:
+        return None
+
+    prev_box = list(previous["bbox"])
+    curr_box = list(current["bbox"])
+    iou = _box_iou(prev_box, curr_box)
+
+    px, py = _box_center(prev_box)
+    cx, cy = _box_center(curr_box)
+    prev_w = max(1.0, float(prev_box[2]) - float(prev_box[0]))
+    prev_h = max(1.0, float(prev_box[3]) - float(prev_box[1]))
+    curr_w = max(1.0, float(curr_box[2]) - float(curr_box[0]))
+    curr_h = max(1.0, float(curr_box[3]) - float(curr_box[1]))
+    diagonal = max((prev_w * prev_w + prev_h * prev_h) ** 0.5, (curr_w * curr_w + curr_h * curr_h) ** 0.5, 1.0)
+    center_distance = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 / diagonal
+
+    prev_area = _box_area(prev_box)
+    curr_area = _box_area(curr_box)
+    if prev_area <= 1.0 or curr_area <= 1.0:
+        return None
+    area_ratio = curr_area / prev_area
+    if not (FALLBACK_MIN_AREA_RATIO <= area_ratio <= FALLBACK_MAX_AREA_RATIO):
+        return None
+
+    if iou < FALLBACK_IOU_THRESHOLD and center_distance > FALLBACK_CENTER_THRESHOLD:
+        return None
+
+    iou_component = iou
+    center_component = max(0.0, 1.0 - center_distance / FALLBACK_CENTER_THRESHOLD)
+    gap_penalty = 1.0 - (gap - 1) / max(1, MAX_FALLBACK_STITCH_GAP)
+    return (0.65 * iou_component + 0.35 * center_component) * max(0.0, gap_penalty)
+
+
+def _stitch_fallback_tracks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recover short temporal tracks from raw fallback detections.
+
+    Only fallback IDs (`det_<frame>_<index>`) are reassigned. Existing ByteTrack
+    IDs are never overwritten by this recovery pass. A fallback observation can
+    attach to an existing recent track only when class, time gap, IoU/center
+    motion, and bounding-box scale are all plausible.
+    """
+    if not rows:
+        return rows
+
+    frame_groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        frame_groups.setdefault(int(row["frame_index"]), []).append(row)
+
+    # Track the latest observation for every known track ID. This lets fallback
+    # detections reconnect to a genuine ByteTrack ID after a short association
+    # failure without changing already-valid tracker assignments.
+    active: dict[str, dict[str, Any]] = {}
+    fallback_counter = 0
+
+    for frame_index in sorted(frame_groups):
+        current_rows = frame_groups[frame_index]
+        used_track_ids: set[str] = set()
+
+        # Stable tracker observations refresh active state first.
+        for row in current_rows:
+            tid = str(row.get("track_id", ""))
+            if not tid.startswith("det_") and tid:
+                active[tid] = row
+                used_track_ids.add(tid)
+
+        fallback_rows = [
+            row for row in current_rows
+            if str(row.get("track_id", "")).startswith("det_") and row.get("class_name") == "animal"
+        ]
+        fallback_rows.sort(key=lambda r: float(r.get("confidence", 0.0)), reverse=True)
+
+        for row in fallback_rows:
+            best_tid = None
+            best_score = -1.0
+            for tid, previous in list(active.items()):
+                if tid in used_track_ids:
+                    continue
+                score = _fallback_match_score(previous, row)
+                if score is not None and score > best_score:
+                    best_tid = tid
+                    best_score = score
+
+            if best_tid is None:
+                fallback_counter += 1
+                best_tid = f"recovered_{fallback_counter}"
+
+            original_id = str(row["track_id"])
+            row["track_id_original"] = original_id
+            row["track_recovered"] = best_tid.startswith("recovered_") or best_tid != original_id
+            row["track_id"] = best_tid
+            active[best_tid] = row
+            used_track_ids.add(best_tid)
+
+    return rows
+
+
+def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) -> dict[int, int]:
+    """Map tracker IDs back to raw detector indices by geometry, not array position."""
     mapping: dict[int, int] = {}
     if len(raw) == 0 or len(tracked) == 0 or tracked.tracker_id is None:
         return mapping
@@ -149,7 +270,6 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
                 result = detector.model.single_image_detection(rgb, det_conf_thres=confidence)
                 detections = _detections_from_result(result)
 
-                # Convert detector boxes back to source-video coordinates before tracking/storage.
                 if len(detections) > 0 and (scale_x != 1.0 or scale_y != 1.0):
                     detections.xyxy[:, [0, 2]] /= scale_x
                     detections.xyxy[:, [1, 3]] /= scale_y
@@ -161,9 +281,6 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
                 raw_class_ids = detections.class_id
                 raw_confidences = detections.confidence
 
-                # Build rows from RAW detector output. Tracker IDs are attached
-                # to raw detections only after an explicit IoU/class match.
-                # Unmatched detections receive a deterministic fallback ID.
                 for i, box in enumerate(raw_boxes):
                     cls_id = int(raw_class_ids[i]) if raw_class_ids is not None else -1
                     score = float(raw_confidences[i]) if raw_confidences is not None else 0.0
@@ -197,6 +314,14 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
         cap.release()
         writer.release()
 
+    # Recover only short-lived fallback associations. This operates after the
+    # detector/tracker pass and therefore cannot perturb MegaDetector boxes or
+    # valid ByteTrack IDs. It gives the behavior clip builder a chance to form
+    # temporal tracks from detections that were spatially consistent but missed
+    # by ByteTrack on one or two sampled frames.
+    track_rows = _stitch_fallback_tracks(track_rows)
+    detection_rows = track_rows.copy()
+
     summary = {
         "input": str(input_path),
         "output": str(annotated_path),
@@ -214,6 +339,8 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
         "detector_input_size": DETECTOR_INPUT_SIZE,
         "detector_confidence": confidence,
         "tracker": "ByteTrack",
+        "temporal_recovery": "spatial_stitch_v1",
+        "temporal_recovery_max_gap": MAX_FALLBACK_STITCH_GAP,
         "device": "cpu",
     }
     detections_path.write_text(json.dumps({"summary": summary, "detections": detection_rows}, indent=2), encoding="utf-8")
