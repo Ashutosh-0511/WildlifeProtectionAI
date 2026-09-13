@@ -23,30 +23,59 @@ def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
-    candidates = []
+    candidates: list[tuple[str, float]] = []
+
     for row in rows:
-        for key in ("prediction", "classification", "classifications"):
+        prediction = row.get("prediction")
+        if isinstance(prediction, str) and prediction.strip():
+            parts = [p.strip() for p in prediction.split(";")]
+            if len(parts) >= 7 and parts[-1]:
+                name = parts[-1]
+            elif len(parts) >= 6 and parts[-2]:
+                name = parts[-2]
+            else:
+                name = prediction.strip()
+            try:
+                score = float(row.get("prediction_score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            candidates.append((name, score))
+
+        for key in ("label", "species", "scientific_name", "common_name"):
             value = row.get(key)
-            if isinstance(value, dict):
-                name = next((value.get(k) for k in ("label", "class", "species", "scientific_name", "common_name")
-                             if isinstance(value.get(k), str) and value.get(k)), None)
-                if name:
-                    try:
-                        score = float(next((value.get(k, 0.0) for k in ("score", "confidence", "probability")
-                                            if value.get(k) is not None), 0.0))
-                    except (TypeError, ValueError):
-                        score = 0.0
-                    candidates.append((name, score))
-            elif isinstance(value, str) and value:
-                candidates.append((value, 0.0))
-        for k in ("label", "species", "scientific_name", "common_name"):
-            if isinstance(row.get(k), str) and row[k]:
+            if isinstance(value, str) and value.strip():
                 try:
-                    score = float(next((row.get(s, 0.0) for s in ("score", "confidence", "probability")
-                                        if row.get(s) is not None), 0.0))
+                    score = float(
+                        row.get(
+                            "prediction_score",
+                            row.get("score", row.get("confidence", row.get("probability", 0.0))),
+                        )
+                    )
                 except (TypeError, ValueError):
                     score = 0.0
-                candidates.append((row[k], score))
+                candidates.append((value.strip(), score))
+
+        for key in ("classification", "classifications"):
+            value = row.get(key)
+            if isinstance(value, dict):
+                name = (
+                    value.get("common_name")
+                    or value.get("species")
+                    or value.get("label")
+                    or value.get("class")
+                )
+                if isinstance(name, str) and name.strip():
+                    try:
+                        score = float(
+                            value.get(
+                                "prediction_score",
+                                value.get("score", value.get("confidence", value.get("probability", 0.0))),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        score = 0.0
+                    candidates.append((name.strip(), score))
+
     return max(candidates, key=lambda x: x[1]) if candidates else ("UNKNOWN", 0.0)
 
 
@@ -137,10 +166,19 @@ def run_integrated(
     track_species = {}
     for tid, paths in crops.items():
         path_set = {str(p.resolve()).lower() for p in paths}
+        path_names = {p.name.lower() for p in paths}
         matching = []
         for r in rows:
             raw = r.get("filepath") or r.get("file") or r.get("image") or r.get("path")
-            if isinstance(raw, str) and str(Path(raw).resolve()).lower() in path_set:
+            if not isinstance(raw, str):
+                continue
+            raw_path = Path(raw)
+            raw_candidates = {
+                str(raw_path.resolve()).lower(),
+                str(raw_path).lower(),
+                raw_path.name.lower(),
+            }
+            if raw_candidates & path_set or raw_path.name.lower() in path_names:
                 matching.append(r)
         species, confidence = _best_species(matching)
         track_species[tid] = {
