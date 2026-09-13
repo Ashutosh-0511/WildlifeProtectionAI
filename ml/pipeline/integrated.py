@@ -236,11 +236,19 @@ def run_integrated(
     track_species = dict(sorted(track_species.items(), key=_species_priority, reverse=True))
 
     # The public API of this function keeps behavior_checkpoint for backwards
-    # compatibility with the dashboard. Stage 1 uses the pretrained X3D-S
-    # backend and does not read the legacy VideoMAE checkpoint.
-    from ml.behavior import BehaviorMapper, X3DBehaviorClassifier
-    _ = behavior_checkpoint
-    behavior_model = X3DBehaviorClassifier(device="cpu")
+    # compatibility with the dashboard. Stage 1 prefers X3D-S, while retaining
+    # the proven VideoMAE backend only as a safety fallback if X3D cannot be
+    # initialized in the local environment.
+    from ml.behavior import BehaviorMapper, VideoMAEBehaviorClassifier, X3DBehaviorClassifier
+    behavior_backend = "X3D-S-Kinetics400-v1"
+    behavior_backend_error = None
+    try:
+        behavior_model = X3DBehaviorClassifier(device="cpu")
+    except Exception as exc:
+        behavior_backend = "VideoMAE-CattleVision-v1-fallback"
+        behavior_backend_error = f"{type(exc).__name__}: {exc}"
+        print(f"WARNING: X3D-S unavailable; falling back to legacy VideoMAE: {behavior_backend_error}")
+        behavior_model = VideoMAEBehaviorClassifier(behavior_checkpoint, device="cpu")
 
     humans_present = any(r.get("class_name") == "person" for r in tracks)
     risk_events = []
@@ -253,7 +261,7 @@ def run_integrated(
         else:
             behavior_result = {
                 "behaviour": "UNKNOWN", "behavior_class": "UNKNOWN", "confidence": 0.0,
-                "frames": 0, "model_version": "X3D-S-Kinetics400-v1",
+                "frames": 0, "model_version": behavior_backend,
                 "reason": "no_track_crops",
             }
         behavior_results[tid] = behavior_result
@@ -273,7 +281,14 @@ def run_integrated(
     result = {
         "input": str(video), "summary": summary, "species": track_species, "behavior": behavior_results,
         "risk_events": risk_events,
-        "models": {"detector": "MegaDetectorV6 MDV6-yolov9-c", "tracker": "ByteTrack", "species": "SpeciesNet 5.x", "behavior": "X3D-S-Kinetics400-v1", "device": "cpu"},
+        "models": {
+            "detector": "MegaDetectorV6 MDV6-yolov9-c",
+            "tracker": "ByteTrack",
+            "species": "SpeciesNet 5.x",
+            "behavior": behavior_backend,
+            "behavior_backend_error": behavior_backend_error,
+            "device": "cpu",
+        },
         "outputs": {"annotated_video": str(video_dir / "annotated.mp4"), "tracks": str(video_dir / "tracks.json"), "species": str(species_json), "crops": str(crop_root), "evidence": evidence_uri},
     }
     (output_dir / "pipeline.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
