@@ -14,6 +14,8 @@ from ml.tracking.bytetrack import ByteTrackAdapter
 
 
 DEFAULT_LABELS = {0: "animal", 1: "person", 2: "vehicle"}
+DETECTOR_INPUT_SIZE = 1280
+DEFAULT_CONFIDENCE = 0.10
 
 
 def _detections_from_result(result: Any) -> sv.Detections:
@@ -36,7 +38,23 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
-def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confidence: float = 0.25) -> dict[str, Any]:
+def _upscale_for_detection(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Upscale small frames for detection and return x/y scale factors."""
+    height, width = frame.shape[:2]
+    if max(width, height) >= DETECTOR_INPUT_SIZE:
+        return frame, 1.0, 1.0
+
+    scale_x = DETECTOR_INPUT_SIZE / width
+    scale_y = DETECTOR_INPUT_SIZE / height
+    resized = cv2.resize(
+        frame,
+        (DETECTOR_INPUT_SIZE, DETECTOR_INPUT_SIZE),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    return resized, scale_x, scale_y
+
+
+def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confidence: float = DEFAULT_CONFIDENCE) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     annotated_path = output_dir / "annotated.mp4"
     detections_path = output_dir / "detections.json"
@@ -74,9 +92,16 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
 
             if frame_index % max(1, sample_every) == 0:
                 sampled_frames += 1
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                detection_frame, scale_x, scale_y = _upscale_for_detection(frame)
+                rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
                 result = detector.model.single_image_detection(rgb, det_conf_thres=confidence)
                 detections = _detections_from_result(result)
+
+                # Convert detector boxes back to the original video resolution.
+                if len(detections) > 0 and (scale_x != 1.0 or scale_y != 1.0):
+                    detections.xyxy[:, [0, 2]] /= scale_x
+                    detections.xyxy[:, [1, 3]] /= scale_y
 
                 # ByteTrack expects xyxy + confidence + class_id.
                 tracked = tracker.update(detections)
@@ -131,6 +156,8 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
         "unique_track_ids": sorted({r["track_id"] for r in track_rows if r["track_id"] is not None}),
         "detector": "MegaDetectorV6",
         "detector_version": "MDV6-yolov9-c",
+        "detector_input_size": DETECTOR_INPUT_SIZE,
+        "detector_confidence": confidence,
         "tracker": "ByteTrack",
         "device": "cpu",
     }
@@ -144,7 +171,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("data/outputs/video_test"))
     parser.add_argument("--sample-every", type=int, default=3)
-    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
     args = parser.parse_args()
     if not args.input.exists():
         raise SystemExit(f"Input video not found: {args.input}")
