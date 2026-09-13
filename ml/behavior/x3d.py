@@ -8,13 +8,13 @@ from typing import Iterable, Sequence
 import numpy as np
 import torch
 from PIL import Image
-from torchvision.models.video import X3D_S_Weights, x3d_s
 from torchvision.transforms import functional as TF
 from torchvision.transforms import InterpolationMode
 
 KINETICS_LABELS_URL = (
     "https://dl.fbaipublicfiles.com/pyslowfast/dataset/class_names/kinetics_classnames.json"
 )
+X3D_REPO = "facebookresearch/pytorchvideo"
 
 _BEHAVIOUR_ALIASES = {
     "running": "RUNNING",
@@ -50,11 +50,13 @@ _BEHAVIOUR_ALIASES = {
 
 
 class X3DBehaviorClassifier:
-    """Pretrained X3D-S behavior backend using torchvision's video models.
+    """Pretrained X3D-S behavior backend loaded directly from PyTorchVideo.
 
-    Stage 1 uses general Kinetics-400 pretrained weights as a motion prior. It
-    does not claim wildlife-specific behavior accuracy. Unrelated Kinetics
-    classes are intentionally mapped to UNKNOWN.
+    The repository does not require the ``pytorchvideo`` package to be installed
+    into the application's environment. Torch Hub fetches the upstream model
+    source and constructs the pretrained X3D-S model in an isolated hub cache.
+    Stage 1 uses general Kinetics-400 weights as a motion prior; it is not yet a
+    wildlife-specific behavior model.
     """
 
     MODEL_NAME = "x3d_s"
@@ -78,14 +80,21 @@ class X3DBehaviorClassifier:
 
     def _load_model(self):
         try:
-            weights = X3D_S_Weights.DEFAULT
-            model = x3d_s(weights=weights)
-            self._weights_transforms = weights.transforms()
+            # PyTorchVideo's X3D implementation is not part of torchvision 0.21.
+            # Load the upstream model code through Torch Hub instead of importing
+            # a separately installed pytorchvideo package that is incompatible
+            # with this project's current Python/PyTorch stack.
+            model = torch.hub.load(
+                X3D_REPO,
+                self.MODEL_NAME,
+                pretrained=True,
+            )
             return model
         except Exception as exc:
             raise RuntimeError(
-                "Unable to load torchvision X3D-S pretrained weights. "
-                "The first run needs network access to download the checkpoint."
+                "Unable to load pretrained X3D-S through Torch Hub. "
+                "The first X3D run needs network access to download the upstream "
+                "PyTorchVideo source/checkpoint and its runtime dependencies."
             ) from exc
 
     def _load_labels(self) -> dict[int, str]:
@@ -147,6 +156,7 @@ class X3DBehaviorClassifier:
             tensor = TF.normalize(tensor, self.MEAN, self.STD)
             processed.append(tensor)
 
+        # X3D expects B,C,T,H,W.
         return torch.stack(processed, dim=1)
 
     @torch.inference_mode()
