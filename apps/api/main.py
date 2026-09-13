@@ -179,7 +179,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}td,th{padding:10px;tex
 <section id="dashboard" class="hidden">
 <div class="grid">
 <div class="card"><div class="label">Animals tracked</div><div id="tracks" class="value">—</div></div>
-<div class="card"><div class="label">Species</div><div id="species" class="value">—</div></div>
+<div class="card"><div class="label">Primary species</div><div id="species" class="value">—</div></div>
 <div class="card"><div class="label">Behaviour</div><div id="behavior" class="value">—</div></div>
 <div class="card"><div class="label">Risk</div><div id="risk" class="value">—</div></div>
 </div>
@@ -209,7 +209,25 @@ table{width:100%;border-collapse:collapse;margin-top:10px}td,th{padding:10px;tex
 </section>
 </main>
 <script>
+const GENERIC_SPECIES=new Set(['unknown','human','person','blank','no cv result','mammal','animal','vehicle']);
+const PRIORITY_SPECIES=new Set([
+ 'lion','tiger','leopard','cheetah','jaguar','snow leopard','clouded leopard',
+ 'hyena','wolf','gray wolf','grey wolf','bear','brown bear','polar bear',
+ 'black bear','sloth bear','wild dog','african wild dog','dingo','coyote',
+ 'jackal','fox','cougar','puma'
+]);
 function esc(x){return String(x??"—").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
+function speciesName(value){return String(value?.species??'UNKNOWN').trim()}
+function choosePrimarySpecies(species){
+ const concrete=species.filter(item=>!GENERIC_SPECIES.has(speciesName(item).toLowerCase()));
+ const pool=concrete.length?concrete:species;
+ return [...pool].sort((a,b)=>{
+   const ap=PRIORITY_SPECIES.has(speciesName(a).toLowerCase())?1:0;
+   const bp=PRIORITY_SPECIES.has(speciesName(b).toLowerCase())?1:0;
+   if(ap!==bp)return bp-ap;
+   return Number(b?.confidence||0)-Number(a?.confidence||0);
+ })[0]||null;
+}
 async function analyze(){
  const input=document.getElementById('file'), btn=document.getElementById('run'), status=document.getElementById('status');
  if(!input.files.length){status.innerHTML='<span class="error">Choose a video first.</span>';return}
@@ -225,17 +243,22 @@ async function analyze(){
 }
 function render(d){
  document.getElementById('dashboard').classList.remove('hidden');
- const summary=d.summary||{}, species=Object.values(d.species||{}), behaviors=Object.values(d.behavior||{}), events=d.risk_events||[];
+ const summary=d.summary||{}, species=Object.values(d.species||{}), behaviors=d.behavior||{}, events=d.risk_events||[];
+ const primarySpecies=choosePrimarySpecies(species);
+ const primaryTrackId=primarySpecies?.track_id||Object.keys(d.species||{}).find(tid=>d.species[tid]===primarySpecies);
+ const primaryBehavior=primaryTrackId?behaviors[primaryTrackId]:null;
+ const primaryEvent=events.find(e=>String(e.track_id)===String(primaryTrackId))||events.find(e=>String(e.species).toLowerCase()===speciesName(primarySpecies).toLowerCase())||events[0]||null;
+ const primaryRisk=primaryEvent?.risk||{};
  document.getElementById('tracks').textContent=(summary.unique_track_ids||[]).length;
- document.getElementById('species').textContent=species[0]?.species||'UNKNOWN';
- document.getElementById('behavior').textContent=behaviors[0]?.behaviour||'UNKNOWN';
- const risk=events[0]?.risk||{}; const level=risk.risk_level||'UNKNOWN';
+ document.getElementById('species').textContent=speciesName(primarySpecies);
+ document.getElementById('behavior').textContent=primaryBehavior?.behaviour||primaryEvent?.behaviour||'UNKNOWN';
+ const level=primaryRisk.risk_level||'UNKNOWN';
  document.getElementById('risk').textContent=level;document.getElementById('risk').className='value '+level;
  document.getElementById('video').src=d.outputs.annotated_video_url;
  if(d.outputs.evidence_url){document.getElementById('evidence').src=d.outputs.evidence_url}
- document.getElementById('confidence').textContent='Behaviour confidence: '+((behaviors[0]?.confidence||0)*100).toFixed(1)+'% • Species confidence: '+((species[0]?.confidence||0)*100).toFixed(1)+'%';
+ document.getElementById('confidence').textContent='Behaviour confidence: '+(((primaryBehavior?.confidence??primaryEvent?.behaviour_confidence??0)*100).toFixed(1))+'% • Species confidence: '+((Number(primarySpecies?.confidence||0)*100).toFixed(1))+'%';
  document.getElementById('rows').innerHTML=events.map(e=>'<tr><td>'+esc(e.track_id)+'</td><td>'+esc(e.species)+'</td><td>'+esc(e.behaviour)+'</td><td>'+((e.behaviour_confidence||0)*100).toFixed(1)+'%</td><td class="'+esc(e.risk?.risk_level)+'">'+esc(e.risk?.risk_level)+'</td><td>'+((e.human_present)?'YES':'NO')+'</td></tr>').join('');
- document.getElementById('factors').innerHTML=(risk.factors||[]).map(f=>'<div class="factor"><span>'+esc(f.name)+'</span><span>'+esc(f.contribution)+'</span></div>').join('');
+ document.getElementById('factors').innerHTML=(primaryRisk.factors||[]).map(f=>'<div class="factor"><span>'+esc(f.name)+'</span><span>'+esc(f.contribution)+'</span></div>').join('');
 }
 </script>
 </body></html>
