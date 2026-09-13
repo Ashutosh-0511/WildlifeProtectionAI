@@ -12,8 +12,11 @@ scikit-learn>=1.5,<2
 soundfile>=0.12,<1
 setuptools==80.9.0
 wheel>=0.44,<1
-PytorchWildlife>=2,<3
-supervision>=0.25,<0.30
+# PytorchWildlife 1.3.0 is the version already validated with this project.
+# It requires supervision 0.23.0; newer supervision releases can change the
+# detection/tracking API used by the current pipeline.
+PytorchWildlife==1.3.0
+supervision==0.23.0
 transformers>=4.45,<5
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
