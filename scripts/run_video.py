@@ -16,15 +16,21 @@ from ml.tracking.bytetrack import ByteTrackAdapter
 DEFAULT_LABELS = {0: "animal", 1: "person", 2: "vehicle"}
 DETECTOR_INPUT_SIZE = 1280
 DEFAULT_CONFIDENCE = 0.10
+
+# Conservative temporal recovery. Behavior clips must not mix two animals.
 MAX_FALLBACK_STITCH_GAP = 6
-FALLBACK_IOU_THRESHOLD = 0.20
-FALLBACK_CENTER_THRESHOLD = 0.35
-FALLBACK_MIN_AREA_RATIO = 0.40
-FALLBACK_MAX_AREA_RATIO = 2.50
+FALLBACK_MIN_SCORE = 0.34
+FALLBACK_DUPLICATE_IOU = 0.50
+FALLBACK_DUPLICATE_CENTER = 0.20
+FALLBACK_MIN_AREA_RATIO = 0.33
+FALLBACK_MAX_AREA_RATIO = 3.00
+FALLBACK_MIN_ASPECT_RATIO = 0.45
+FALLBACK_MAX_ASPECT_RATIO = 2.20
+FALLBACK_CENTER_THRESHOLD = 0.45
+FALLBACK_IOU_THRESHOLD = 0.12
 
 
 def _detections_from_result(result: Any) -> sv.Detections:
-    """Extract the Supervision Detections object returned by PyTorch-Wildlife."""
     if isinstance(result, dict) and isinstance(result.get("detections"), sv.Detections):
         return result["detections"]
     if isinstance(result, sv.Detections):
@@ -43,8 +49,9 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
-def _upscale_for_detection(frame: np.ndarray, target_size: int = DETECTOR_INPUT_SIZE) -> tuple[np.ndarray, float, float]:
-    """Upscale small frames for detection and return x/y scale factors."""
+def _upscale_for_detection(
+    frame: np.ndarray, target_size: int = DETECTOR_INPUT_SIZE
+) -> tuple[np.ndarray, float, float]:
     height, width = frame.shape[:2]
     if max(width, height) >= target_size:
         return frame, 1.0, 1.0
@@ -55,7 +62,6 @@ def _upscale_for_detection(frame: np.ndarray, target_size: int = DETECTOR_INPUT_
 
 
 def _box_iou_one_to_many(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-    """Compute IoU between one xyxy box and an array of xyxy boxes."""
     if boxes.size == 0:
         return np.empty((0,), dtype=float)
     x1 = np.maximum(box[0], boxes[:, 0])
@@ -85,15 +91,42 @@ def _box_area(box: list[float]) -> float:
     return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
 
 
-def _fallback_match_score(previous: dict[str, Any], current: dict[str, Any]) -> float | None:
-    """Return a conservative spatial continuity score for fallback detections.
+def _box_dimensions(box: list[float]) -> tuple[float, float]:
+    return max(1.0, float(box[2]) - float(box[0])), max(1.0, float(box[3]) - float(box[1]))
 
-    Fallback detector IDs are created when ByteTrack does not return an ID for a
-    raw detection. We may reuse a recent track ID only when the boxes are
-    geometrically consistent. This avoids turning every one-frame detection into
-    a separate behavior track while refusing obviously different animals.
-    """
+
+def _center_distance_normalized(box_a: list[float], box_b: list[float]) -> float:
+    ax, ay = _box_center(box_a)
+    bx, by = _box_center(box_b)
+    aw, ah = _box_dimensions(box_a)
+    bw, bh = _box_dimensions(box_b)
+    diagonal = max((aw * aw + ah * ah) ** 0.5, (bw * bw + bh * bh) ** 0.5, 1.0)
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 / diagonal
+
+
+def _area_ratio(box_a: list[float], box_b: list[float]) -> float:
+    a = _box_area(box_a)
+    b = _box_area(box_b)
+    if a <= 1.0 or b <= 1.0:
+        return float("inf")
+    return b / a
+
+
+def _aspect_ratio_ratio(box_a: list[float], box_b: list[float]) -> float:
+    aw, ah = _box_dimensions(box_a)
+    bw, bh = _box_dimensions(box_b)
+    return (bw / bh) / max(aw / ah, 1e-9)
+
+
+def _is_fallback_id(track_id: Any) -> bool:
+    return str(track_id or "").startswith("det_")
+
+
+def _association_score(previous: dict[str, Any], current: dict[str, Any]) -> float | None:
+    """Score a fallback-to-track association using temporal geometry."""
     if previous.get("class_name") != current.get("class_name"):
+        return None
+    if previous.get("class_name") != "animal":
         return None
 
     gap = int(current["frame_index"]) - int(previous["frame_index"])
@@ -103,94 +136,186 @@ def _fallback_match_score(previous: dict[str, Any], current: dict[str, Any]) -> 
     prev_box = list(previous["bbox"])
     curr_box = list(current["bbox"])
     iou = _box_iou(prev_box, curr_box)
+    center_distance = _center_distance_normalized(prev_box, curr_box)
+    area_ratio = _area_ratio(prev_box, curr_box)
+    aspect_ratio = _aspect_ratio_ratio(prev_box, curr_box)
 
-    px, py = _box_center(prev_box)
-    cx, cy = _box_center(curr_box)
-    prev_w = max(1.0, float(prev_box[2]) - float(prev_box[0]))
-    prev_h = max(1.0, float(prev_box[3]) - float(prev_box[1]))
-    curr_w = max(1.0, float(curr_box[2]) - float(curr_box[0]))
-    curr_h = max(1.0, float(curr_box[3]) - float(curr_box[1]))
-    diagonal = max((prev_w * prev_w + prev_h * prev_h) ** 0.5, (curr_w * curr_w + curr_h * curr_h) ** 0.5, 1.0)
-    center_distance = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 / diagonal
-
-    prev_area = _box_area(prev_box)
-    curr_area = _box_area(curr_box)
-    if prev_area <= 1.0 or curr_area <= 1.0:
-        return None
-    area_ratio = curr_area / prev_area
     if not (FALLBACK_MIN_AREA_RATIO <= area_ratio <= FALLBACK_MAX_AREA_RATIO):
         return None
-
+    if not (FALLBACK_MIN_ASPECT_RATIO <= aspect_ratio <= FALLBACK_MAX_ASPECT_RATIO):
+        return None
     if iou < FALLBACK_IOU_THRESHOLD and center_distance > FALLBACK_CENTER_THRESHOLD:
         return None
 
-    iou_component = iou
+    iou_component = min(1.0, iou / max(FALLBACK_DUPLICATE_IOU, 1e-6))
     center_component = max(0.0, 1.0 - center_distance / FALLBACK_CENTER_THRESHOLD)
-    gap_penalty = 1.0 - (gap - 1) / max(1, MAX_FALLBACK_STITCH_GAP)
-    return (0.65 * iou_component + 0.35 * center_component) * max(0.0, gap_penalty)
+    scale_component = max(
+        0.0,
+        1.0 - abs(np.log(max(area_ratio, 1e-9))) / np.log(FALLBACK_MAX_AREA_RATIO),
+    )
+    gap_component = 1.0 - (gap - 1) / max(1, MAX_FALLBACK_STITCH_GAP)
+    return float(
+        0.45 * iou_component
+        + 0.35 * center_component
+        + 0.15 * scale_component
+        + 0.05 * max(0.0, gap_component)
+    )
 
 
-def _stitch_fallback_tracks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Recover short temporal tracks from raw fallback detections.
+def _same_frame_duplicate(track_row: dict[str, Any], fallback_row: dict[str, Any]) -> bool:
+    """Return True when fallback is effectively the same object as a valid track."""
+    if track_row.get("class_name") != fallback_row.get("class_name"):
+        return False
+    track_box = list(track_row["bbox"])
+    fallback_box = list(fallback_row["bbox"])
+    iou = _box_iou(track_box, fallback_box)
+    center_distance = _center_distance_normalized(track_box, fallback_box)
+    area_ratio = _area_ratio(track_box, fallback_box)
+    return iou >= FALLBACK_DUPLICATE_IOU or (
+        center_distance <= FALLBACK_DUPLICATE_CENTER
+        and FALLBACK_MIN_AREA_RATIO <= area_ratio <= FALLBACK_MAX_AREA_RATIO
+    )
 
-    Only fallback IDs (`det_<frame>_<index>`) are reassigned. Existing ByteTrack
-    IDs are never overwritten by this recovery pass. A fallback observation can
-    attach to an existing recent track only when class, time gap, IoU/center
-    motion, and bounding-box scale are all plausible.
-    """
+
+def _stitch_fallback_tracks(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Recover fallback detections with one-to-one, conflict-safe assignment."""
     if not rows:
-        return rows
+        return rows, {
+            "fallback_rows": 0,
+            "matched_existing": 0,
+            "new_recovered": 0,
+            "duplicate_rejected": 0,
+            "ambiguous_rejected": 0,
+        }
 
     frame_groups: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         frame_groups.setdefault(int(row["frame_index"]), []).append(row)
 
-    # Track the latest observation for every known track ID. This lets fallback
-    # detections reconnect to a genuine ByteTrack ID after a short association
-    # failure without changing already-valid tracker assignments.
     active: dict[str, dict[str, Any]] = {}
-    fallback_counter = 0
+    recovered_counter = 0
+    stats = {
+        "fallback_rows": 0,
+        "matched_existing": 0,
+        "new_recovered": 0,
+        "duplicate_rejected": 0,
+        "ambiguous_rejected": 0,
+    }
+    kept_rows: list[dict[str, Any]] = []
 
     for frame_index in sorted(frame_groups):
         current_rows = frame_groups[frame_index]
-        used_track_ids: set[str] = set()
-
-        # Stable tracker observations refresh active state first.
-        for row in current_rows:
-            tid = str(row.get("track_id", ""))
-            if not tid.startswith("det_") and tid:
-                active[tid] = row
-                used_track_ids.add(tid)
-
-        fallback_rows = [
-            row for row in current_rows
-            if str(row.get("track_id", "")).startswith("det_") and row.get("class_name") == "animal"
+        stable_rows = [
+            row
+            for row in current_rows
+            if not _is_fallback_id(row.get("track_id")) and row.get("class_name") == "animal"
         ]
-        fallback_rows.sort(key=lambda r: float(r.get("confidence", 0.0)), reverse=True)
+        fallback_rows = [
+            row
+            for row in current_rows
+            if _is_fallback_id(row.get("track_id")) and row.get("class_name") == "animal"
+        ]
+        stats["fallback_rows"] += len(fallback_rows)
 
-        for row in fallback_rows:
-            best_tid = None
-            best_score = -1.0
+        duplicate_indices: set[int] = set()
+        for idx, row in enumerate(fallback_rows):
+            for stable in stable_rows:
+                if _same_frame_duplicate(stable, row):
+                    row["track_id_original"] = str(row["track_id"])
+                    row["track_recovered"] = False
+                    row["tracking_ignored"] = True
+                    row["tracking_ignore_reason"] = "duplicate_of_valid_bytetrack"
+                    row["duplicate_of_track_id"] = str(stable["track_id"])
+                    duplicate_indices.add(idx)
+                    stats["duplicate_rejected"] += 1
+                    break
+
+        # Existing ByteTrack observations are authoritative.
+        for stable in stable_rows:
+            tid = str(stable["track_id"])
+            active[tid] = stable
+            stable["track_recovered"] = False
+            stable["tracking_ignored"] = False
+            kept_rows.append(stable)
+
+        # Build all candidate edges first, then solve greedily by descending score.
+        candidates: list[tuple[float, int, str]] = []
+        for row_idx, row in enumerate(fallback_rows):
+            if row_idx in duplicate_indices:
+                continue
             for tid, previous in list(active.items()):
-                if tid in used_track_ids:
+                score = _association_score(previous, row)
+                if score is None or score < FALLBACK_MIN_SCORE:
                     continue
-                score = _fallback_match_score(previous, row)
-                if score is not None and score > best_score:
-                    best_tid = tid
-                    best_score = score
+                # Prefer a real ByteTrack identity over a synthetic one when
+                # geometry is otherwise comparable.
+                if not tid.startswith("recovered_"):
+                    score += 0.06
+                candidates.append((score, row_idx, tid))
+        candidates.sort(key=lambda item: item[0], reverse=True)
 
-            if best_tid is None:
-                fallback_counter += 1
-                best_tid = f"recovered_{fallback_counter}"
+        assigned_rows: set[int] = set()
+        assigned_tracks: set[str] = set()
+        assignment: dict[int, str] = {}
+        assignment_score: dict[int, float] = {}
+        candidate_scores_by_row: dict[int, list[tuple[float, str]]] = {}
+        for score, row_idx, tid in candidates:
+            candidate_scores_by_row.setdefault(row_idx, []).append((score, tid))
+            if row_idx in assigned_rows or tid in assigned_tracks:
+                continue
+            assigned_rows.add(row_idx)
+            assigned_tracks.add(tid)
+            assignment[row_idx] = tid
+            assignment_score[row_idx] = score
+
+        # Reject genuinely ambiguous matches instead of forcing identity.
+        for row_idx, tid in list(assignment.items()):
+            alternatives = [
+                (score, candidate_tid)
+                for score, candidate_tid in candidate_scores_by_row.get(row_idx, [])
+                if candidate_tid != tid
+            ]
+            if alternatives:
+                best = assignment_score[row_idx]
+                alt_score, _ = max(alternatives, key=lambda item: item[0])
+                if abs(best - alt_score) < 0.035:
+                    assignment.pop(row_idx, None)
+                    assignment_score.pop(row_idx, None)
+                    stats["ambiguous_rejected"] += 1
+
+        for row_idx, row in enumerate(fallback_rows):
+            if row_idx in duplicate_indices:
+                continue
 
             original_id = str(row["track_id"])
             row["track_id_original"] = original_id
-            row["track_recovered"] = best_tid.startswith("recovered_") or best_tid != original_id
-            row["track_id"] = best_tid
-            active[best_tid] = row
-            used_track_ids.add(best_tid)
+            row["tracking_ignored"] = False
 
-    return rows
+            tid = assignment.get(row_idx)
+            if tid is None:
+                recovered_counter += 1
+                tid = f"recovered_{recovered_counter}"
+                row["track_recovered"] = True
+                stats["new_recovered"] += 1
+            else:
+                row["track_recovered"] = tid.startswith("recovered_")
+                stats["matched_existing"] += 1
+
+            row["track_id"] = tid
+            active[tid] = row
+            kept_rows.append(row)
+
+        # Expire identities after a real temporal gap.
+        for tid in [
+            tid
+            for tid, previous in active.items()
+            if frame_index - int(previous["frame_index"]) > MAX_FALLBACK_STITCH_GAP
+        ]:
+            active.pop(tid, None)
+
+    return kept_rows, stats
 
 
 def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) -> dict[int, int]:
@@ -214,7 +339,11 @@ def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) 
         for raw_idx, iou in enumerate(ious):
             if raw_idx in used_raw:
                 continue
-            if raw_classes is not None and tracked_classes is not None and raw_classes[raw_idx] != tracked_classes[tracked_idx]:
+            if (
+                raw_classes is not None
+                and tracked_classes is not None
+                and raw_classes[raw_idx] != tracked_classes[tracked_idx]
+            ):
                 continue
             candidates.append((float(iou), int(tracked_idx), int(raw_idx), int(tracker_value)))
 
@@ -227,7 +356,12 @@ def _tracker_ids_for_raw_detections(raw: sv.Detections, tracked: sv.Detections) 
     return mapping
 
 
-def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confidence: float = DEFAULT_CONFIDENCE) -> dict[str, Any]:
+def run_video(
+    input_path: Path,
+    output_dir: Path,
+    sample_every: int = 3,
+    confidence: float = DEFAULT_CONFIDENCE,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     annotated_path = output_dir / "annotated.mp4"
     detections_path = output_dir / "detections.json"
@@ -253,7 +387,7 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
     tracker.load()
 
     detection_rows: list[dict[str, Any]] = []
-    track_rows: list[dict[str, Any]] = []
+    raw_track_rows: list[dict[str, Any]] = []
     frame_index = 0
     sampled_frames = 0
 
@@ -299,14 +433,22 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
                         "track_id": track_id,
                         "tracked": tracked_flag,
                     }
-                    detection_rows.append(row)
-                    track_rows.append(row.copy())
+                    detection_rows.append(row.copy())
+                    raw_track_rows.append(row)
 
                     p1 = (int(x1), int(y1))
                     p2 = (int(x2), int(y2))
                     cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
                     label = f"#{track_id} {row['class_name']} {score:.2f}"
-                    cv2.putText(frame, label, (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                    cv2.putText(
+                        frame,
+                        label,
+                        (p1[0], max(20, p1[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2,
+                    )
 
             writer.write(frame)
             frame_index += 1
@@ -314,13 +456,7 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
         cap.release()
         writer.release()
 
-    # Recover only short-lived fallback associations. This operates after the
-    # detector/tracker pass and therefore cannot perturb MegaDetector boxes or
-    # valid ByteTrack IDs. It gives the behavior clip builder a chance to form
-    # temporal tracks from detections that were spatially consistent but missed
-    # by ByteTrack on one or two sampled frames.
-    track_rows = _stitch_fallback_tracks(track_rows)
-    detection_rows = track_rows.copy()
+    track_rows, recovery_stats = _stitch_fallback_tracks(raw_track_rows)
 
     summary = {
         "input": str(input_path),
@@ -333,33 +469,50 @@ def run_video(input_path: Path, output_dir: Path, sample_every: int = 3, confide
         "sampled_frames": sampled_frames,
         "detection_count": len(detection_rows),
         "track_observation_count": len(track_rows),
-        "unique_track_ids": sorted({r["track_id"] for r in track_rows if r["track_id"] is not None}),
+        "unique_track_ids": sorted({r["track_id"] for r in track_rows if r.get("track_id") is not None}),
         "detector": "MegaDetectorV6",
         "detector_version": "MDV6-yolov9-c",
         "detector_input_size": DETECTOR_INPUT_SIZE,
         "detector_confidence": confidence,
         "tracker": "ByteTrack",
-        "temporal_recovery": "spatial_stitch_v1",
+        "temporal_recovery": "spatial_stitch_v2",
         "temporal_recovery_max_gap": MAX_FALLBACK_STITCH_GAP,
+        "temporal_recovery_policy": {
+            "one_to_one_assignment": True,
+            "duplicate_of_valid_bytetrack_rejected": True,
+            "ambiguous_matches_rejected": True,
+            "valid_bytetrack_ids_preserved": True,
+        },
+        "temporal_recovery_stats": recovery_stats,
         "device": "cpu",
     }
-    detections_path.write_text(json.dumps({"summary": summary, "detections": detection_rows}, indent=2), encoding="utf-8")
-    tracks_path.write_text(json.dumps({"summary": summary, "tracks": track_rows}, indent=2), encoding="utf-8")
+
+    detections_path.write_text(
+        json.dumps({"summary": summary, "detections": detection_rows}, indent=2),
+        encoding="utf-8",
+    )
+    tracks_path.write_text(
+        json.dumps({"summary": summary, "tracks": track_rows}, indent=2),
+        encoding="utf-8",
+    )
     return summary
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run MegaDetector + ByteTrack on a video.")
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/outputs/video_test"))
+    parser = argparse.ArgumentParser(description="Run MegaDetector + ByteTrack on a video")
+    parser.add_argument("input", type=Path, help="Input video path")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/video"))
     parser.add_argument("--sample-every", type=int, default=3)
     parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
     args = parser.parse_args()
-    if not args.input.exists():
-        raise SystemExit(f"Input video not found: {args.input}")
-    summary = run_video(args.input, args.output_dir, args.sample_every, args.confidence)
+
+    summary = run_video(
+        input_path=args.input,
+        output_dir=args.output_dir,
+        sample_every=max(1, args.sample_every),
+        confidence=args.confidence,
+    )
     print(json.dumps(summary, indent=2))
-    print("VIDEO_PIPELINE_OK")
 
 
 if __name__ == "__main__":
