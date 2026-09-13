@@ -13,6 +13,7 @@ from ml.species.speciesnet import SpeciesNetAdapter
 from ml.risk.engine import RiskInput, score_risk
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+DETECTOR_CONFIDENCE = 0.10
 
 
 def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -60,25 +61,13 @@ def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
 
 def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Path, per_track: int = 16) -> dict[str, list[Path]]:
     by_track: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    untracked_animals: list[dict[str, Any]] = []
-
     for row in tracks:
-        if row.get("class_name") != "animal":
-            continue
-        if row.get("track_id") is not None:
+        if row.get("class_name") == "animal" and row.get("track_id") is not None:
             by_track[str(row["track_id"])].append(row)
-        else:
-            untracked_animals.append(row)
-
-    # ByteTrack can legitimately have a missing ID on the first/short-lived
-    # detections. Keep those frames as one fallback sequence so SpeciesNet still
-    # receives animal crops instead of silently producing an empty predictions file.
-    if untracked_animals and not by_track:
-        by_track["untracked_animal"] = untracked_animals
 
     selected: dict[str, list[dict[str, Any]]] = {}
     for tid, rows in by_track.items():
-        rows.sort(key=lambda r: r["frame_index"])
+        rows.sort(key=lambda r: int(r["frame_index"]))
         if len(rows) <= per_track:
             selected[tid] = rows
         else:
@@ -90,9 +79,8 @@ def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Pa
     crop_root.mkdir(parents=True, exist_ok=True)
 
     for frame_index, _, frame in read_video(video, sample_every=1):
-        for tid, fi in list(wanted):
-            if fi != frame_index:
-                continue
+        matches = [(tid, fi) for tid, fi in wanted if fi == frame_index]
+        for tid, _ in matches:
             row = next(r for r in selected[tid] if int(r["frame_index"]) == frame_index)
             x1, y1, x2, y2 = [int(v) for v in row["bbox"]]
             h, w = frame.shape[:2]
@@ -137,7 +125,7 @@ def run_integrated(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     video_dir = output_dir / "video"
-    summary = run_video(video, video_dir, sample_every=sample_every, confidence=0.25)
+    summary = run_video(video, video_dir, sample_every=sample_every, confidence=DETECTOR_CONFIDENCE)
     tracks = json.loads((video_dir / "tracks.json").read_text(encoding="utf-8")).get("tracks", [])
 
     crop_root = output_dir / "track_crops"
