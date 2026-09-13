@@ -8,18 +8,14 @@ from typing import Iterable, Sequence
 import numpy as np
 import torch
 from PIL import Image
+from torchvision.models.video import X3D_S_Weights, x3d_s
 from torchvision.transforms import functional as TF
 from torchvision.transforms import InterpolationMode
-
 
 KINETICS_LABELS_URL = (
     "https://dl.fbaipublicfiles.com/pyslowfast/dataset/class_names/kinetics_classnames.json"
 )
-X3D_REPO = "facebookresearch/pytorchvideo"
 
-# Kinetics-400 contains many actions that are irrelevant to wildlife behavior.
-# Only map labels that carry a useful animal-motion/action signal. Everything
-# else is deliberately reported as UNKNOWN rather than inventing a behavior.
 _BEHAVIOUR_ALIASES = {
     "running": "RUNNING",
     "running on treadmill": "RUNNING",
@@ -54,13 +50,11 @@ _BEHAVIOUR_ALIASES = {
 
 
 class X3DBehaviorClassifier:
-    """Pretrained X3D-S behavior backend for wildlife video clips.
+    """Pretrained X3D-S behavior backend using torchvision's video models.
 
-    Stage 1 intentionally uses the published Kinetics-400 X3D-S weights as a
-    general video-motion prior. It does not pretend that Kinetics is a
-    wildlife-specific behavior dataset. Only recognizable action labels are
-    translated into the application's behavior ontology; unrelated Kinetics
-    classes become UNKNOWN.
+    Stage 1 uses general Kinetics-400 pretrained weights as a motion prior. It
+    does not claim wildlife-specific behavior accuracy. Unrelated Kinetics
+    classes are intentionally mapped to UNKNOWN.
     """
 
     MODEL_NAME = "x3d_s"
@@ -68,7 +62,6 @@ class X3DBehaviorClassifier:
     NUM_FRAMES = 13
     SIDE_SIZE = 182
     CROP_SIZE = 182
-    SAMPLE_RATE = 6
     MEAN = (0.45, 0.45, 0.45)
     STD = (0.225, 0.225, 0.225)
 
@@ -85,14 +78,15 @@ class X3DBehaviorClassifier:
 
     def _load_model(self):
         try:
-            model = torch.hub.load(X3D_REPO, self.MODEL_NAME, pretrained=True)
+            weights = X3D_S_Weights.DEFAULT
+            model = x3d_s(weights=weights)
+            self._weights_transforms = weights.transforms()
+            return model
         except Exception as exc:
             raise RuntimeError(
-                "Unable to load pretrained X3D-S. The first run needs network access "
-                "to download the PyTorchVideo model and its dependencies. "
-                "Install fvcore/iopath if the hub import reports missing packages."
+                "Unable to load torchvision X3D-S pretrained weights. "
+                "The first run needs network access to download the checkpoint."
             ) from exc
-        return model
 
     def _load_labels(self) -> dict[int, str]:
         cache_path = self.cache_dir / "kinetics_classnames.json"
@@ -153,7 +147,6 @@ class X3DBehaviorClassifier:
             tensor = TF.normalize(tensor, self.MEAN, self.STD)
             processed.append(tensor)
 
-        # X3D expects B,C,T,H,W.
         return torch.stack(processed, dim=1)
 
     @torch.inference_mode()
@@ -167,10 +160,7 @@ class X3DBehaviorClassifier:
         candidates = []
         for score, index in zip(values.tolist(), indices.tolist()):
             label = self.labels.get(int(index), f"KineticsClass_{index}")
-            candidates.append({
-                "label": label,
-                "confidence": float(score),
-            })
+            candidates.append({"label": label, "confidence": float(score)})
 
         source_label = candidates[0]["label"] if candidates else "UNKNOWN"
         behaviour = _BEHAVIOUR_ALIASES.get(source_label.strip().lower(), "UNKNOWN")
