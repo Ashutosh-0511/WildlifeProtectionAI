@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 from ml.pipeline.video import read_video
 from ml.species.speciesnet import SpeciesNetAdapter
@@ -15,6 +16,9 @@ from ml.risk.engine import RiskInput, score_risk
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 DETECTOR_CONFIDENCE = 0.10
 INVALID_SPECIES = {"human", "person", "blank", "no cv result", "mammal", "animal", "vehicle"}
+MIN_BEHAVIOR_FRAMES = 16
+MAX_BEHAVIOR_FRAMES = 32
+MAX_INTERPOLATION_GAP = 6
 
 
 def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -74,28 +78,17 @@ def _leaf_candidates(row: dict[str, Any]) -> list[tuple[str, float]]:
 
 
 def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
-    """Choose a concrete wildlife species from detector-valid SpeciesNet results.
-
-    SpeciesNet may roll a concrete prediction up to a generic class such as
-    ``mammal`` even while its ranked leaf classes contain ``lion``. It can also
-    return human as the classifier winner for a crop that was originally
-    supplied as an animal track. We therefore use SpeciesNet's own detection
-    evidence to reject human-only crops and aggregate concrete leaf classes.
-    """
+    """Choose a concrete wildlife species from detector-valid SpeciesNet results."""
     weighted_scores: dict[str, float] = defaultdict(float)
     weight_totals: dict[str, float] = defaultdict(float)
 
     for row in rows:
         animal_conf, human_conf = _detector_evidence(row)
         if animal_conf > 0.0:
-            # A crop whose own detector sees a human more strongly than an
-            # animal is not reliable evidence for the animal track.
             if human_conf > animal_conf * 0.9:
                 continue
             evidence_weight = max(animal_conf, 0.05)
         else:
-            # Rows without detector metadata are retained only when their
-            # prediction is already a concrete non-human wildlife species.
             prediction = row.get("prediction")
             if not isinstance(prediction, str):
                 continue
@@ -123,6 +116,7 @@ def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
 
 
 def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Path, per_track: int = 16) -> dict[str, list[Path]]:
+    """Create sampled track crops for SpeciesNet without changing its behavior."""
     by_track: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in tracks:
         if row.get("class_name") == "animal" and row.get("track_id") is not None:
@@ -157,6 +151,145 @@ def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Pa
         if selected and len(out) == len(selected) and all(len(out[k]) == len(selected[k]) for k in selected):
             break
     return dict(out)
+
+
+def _interpolated_bbox(rows_by_frame: dict[int, dict[str, Any]], frame_index: int) -> list[float] | None:
+    """Interpolate a tracked bbox for an actual video frame.
+
+    Detector/tracker observations arrive every `sample_every` frames. For
+    behavior inference we reconstruct the missing in-between boxes so X3D sees
+    actual consecutive frames rather than a sparse sequence of detector crops.
+    Interpolation is only permitted across short gaps; large gaps are treated as
+    a broken track and never filled with fabricated motion.
+    """
+    if frame_index in rows_by_frame:
+        return [float(v) for v in rows_by_frame[frame_index]["bbox"]]
+
+    frames = sorted(rows_by_frame)
+    if not frames:
+        return None
+
+    prev = max((f for f in frames if f < frame_index), default=None)
+    nxt = min((f for f in frames if f > frame_index), default=None)
+    if prev is None or nxt is None or nxt - prev > MAX_INTERPOLATION_GAP:
+        return None
+
+    a = np.asarray(rows_by_frame[prev]["bbox"], dtype=float)
+    b = np.asarray(rows_by_frame[nxt]["bbox"], dtype=float)
+    alpha = (frame_index - prev) / float(nxt - prev)
+    return (a + alpha * (b - a)).tolist()
+
+
+def extract_behavior_clips(
+    video: Path,
+    tracks: list[dict[str, Any]],
+    crop_root: Path,
+    min_frames: int = MIN_BEHAVIOR_FRAMES,
+    max_frames: int = MAX_BEHAVIOR_FRAMES,
+) -> tuple[dict[str, list[Path]], dict[str, dict[str, Any]]]:
+    """Build dense 16-32 frame behavior clips for every sufficiently long track.
+
+    Tracks are contiguous only when their observed detector boxes can be joined
+    by short, regular gaps. A single-frame/fallback detection is therefore not
+    turned into a fake temporal clip. Such tracks are returned in the metadata
+    with an explicit `insufficient_temporal_context` status.
+    """
+    by_track: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in tracks:
+        if row.get("class_name") == "animal" and row.get("track_id") is not None:
+            by_track[str(row["track_id"])].append(row)
+
+    selected_windows: dict[str, tuple[int, int]] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for tid, rows in by_track.items():
+        rows.sort(key=lambda r: int(r["frame_index"]))
+        frames = [int(r["frame_index"]) for r in rows]
+        longest_start = None
+        longest_end = None
+        run_start = frames[0] if frames else None
+        previous = frames[0] if frames else None
+
+        for current in frames[1:]:
+            gap = current - int(previous)
+            if gap > MAX_INTERPOLATION_GAP:
+                if run_start is not None and previous is not None:
+                    if longest_start is None or (previous - run_start) > (longest_end - longest_start):
+                        longest_start, longest_end = run_start, int(previous)
+                run_start = current
+            previous = current
+        if run_start is not None and previous is not None and (longest_start is None or (previous - run_start) > (longest_end - longest_start)):
+            longest_start, longest_end = run_start, int(previous)
+
+        span = 0 if longest_start is None or longest_end is None else longest_end - longest_start + 1
+        if span < min_frames:
+            metadata[tid] = {
+                "status": "insufficient_temporal_context",
+                "observed_frames": len(rows),
+                "temporal_span_frames": span,
+                "required_min_frames": min_frames,
+                "max_behavior_frames": max_frames,
+            }
+            continue
+
+        # Prefer a 32-frame contiguous window; if the track is shorter, use 16-31.
+        window_length = min(max_frames, span)
+        start = longest_start + max(0, (span - window_length) // 2)
+        end = start + window_length - 1
+        selected_windows[tid] = (start, end)
+        metadata[tid] = {
+            "status": "ready",
+            "observed_frames": len(rows),
+            "temporal_span_frames": span,
+            "clip_start_frame": start,
+            "clip_end_frame": end,
+            "clip_length_frames": window_length,
+        }
+
+    if not selected_windows:
+        return {}, metadata
+
+    rows_maps = {
+        tid: {int(row["frame_index"]): row for row in by_track[tid]}
+        for tid in selected_windows
+    }
+    crop_root.mkdir(parents=True, exist_ok=True)
+    out: dict[str, list[Path]] = defaultdict(list)
+    wanted = {
+        (tid, frame_index)
+        for tid, (start, end) in selected_windows.items()
+        for frame_index in range(start, end + 1)
+    }
+
+    for frame_index, _, frame in read_video(video, sample_every=1):
+        matching = [(tid, fi) for tid, fi in wanted if fi == frame_index]
+        for tid, _ in matching:
+            bbox = _interpolated_bbox(rows_maps[tid], frame_index)
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            path = crop_root / f"track_{tid}" / f"frame_{frame_index:08d}.jpg"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if cv2.imwrite(str(path), frame[y1:y2, x1:x2]):
+                out[tid].append(path)
+        if selected_windows and all(len(out[tid]) >= (end - start + 1) for tid, (start, end) in selected_windows.items()):
+            break
+
+    # A dense clip is only considered valid when every requested frame exists.
+    for tid, (start, end) in selected_windows.items():
+        expected = end - start + 1
+        if len(out.get(tid, [])) != expected:
+            metadata[tid]["status"] = "clip_build_failed"
+            metadata[tid]["expected_frames"] = expected
+            metadata[tid]["actual_frames"] = len(out.get(tid, []))
+            out.pop(tid, None)
+        else:
+            metadata[tid]["actual_frames"] = len(out[tid])
+
+    return dict(out), metadata
 
 
 def _write_evidence_frame(video: Path, tracks: list[dict[str, Any]], output_dir: Path) -> str | None:
@@ -194,6 +327,9 @@ def run_integrated(
     crop_root = output_dir / "track_crops"
     crops = extract_track_crops(video, tracks, crop_root, per_track=max(16, species_samples))
 
+    behavior_root = output_dir / "behavior_clips"
+    behavior_crops, behavior_clip_meta = extract_behavior_clips(video, tracks, behavior_root)
+
     species_root = output_dir / "species"
     species_root.mkdir(parents=True, exist_ok=True)
     species_json = species_root / "predictions.json"
@@ -224,10 +360,9 @@ def run_integrated(
             "confidence": confidence,
             "sample_count": len(paths),
             "classified_count": len(matching),
+            "behavior_clip": behavior_clip_meta.get(tid, {"status": "not_available"}),
         }
 
-    # Put concrete wildlife tracks before unknown/generic/human outputs so the
-    # dashboard's primary species card reflects the strongest wildlife evidence.
     def _species_priority(item: tuple[str, dict[str, Any]]) -> tuple[int, float]:
         species = str(item[1].get("species", "UNKNOWN")).casefold()
         concrete = int(species not in {"unknown", "human", "person", "blank", "no cv result", "mammal", "animal", "vehicle"})
@@ -235,10 +370,6 @@ def run_integrated(
 
     track_species = dict(sorted(track_species.items(), key=_species_priority, reverse=True))
 
-    # The public API of this function keeps behavior_checkpoint for backwards
-    # compatibility with the dashboard. Stage 1 prefers X3D-S, while retaining
-    # the proven VideoMAE backend only as a safety fallback if X3D cannot be
-    # initialized in the local environment.
     from ml.behavior import BehaviorMapper, VideoMAEBehaviorClassifier, X3DBehaviorClassifier
     behavior_backend = "X3D-S-Kinetics400-v1"
     behavior_backend_error = None
@@ -256,13 +387,17 @@ def run_integrated(
     evidence_uri = _write_evidence_frame(video, tracks, output_dir)
 
     for tid, info in track_species.items():
-        if tid in crops and crops[tid]:
-            behavior_result = BehaviorMapper.enrich(behavior_model.predict_paths(crops[tid]))
+        clip_paths = behavior_crops.get(tid, [])
+        clip_meta = behavior_clip_meta.get(tid, {"status": "not_available"})
+        if clip_paths and len(clip_paths) >= MIN_BEHAVIOR_FRAMES:
+            behavior_result = BehaviorMapper.enrich(behavior_model.predict_paths(clip_paths))
+            behavior_result["clip_construction"] = clip_meta
         else:
             behavior_result = {
                 "behaviour": "UNKNOWN", "behavior_class": "UNKNOWN", "confidence": 0.0,
-                "frames": 0, "model_version": behavior_backend,
-                "reason": "no_track_crops",
+                "frames": len(clip_paths), "model_version": behavior_backend,
+                "reason": "insufficient_temporal_context",
+                "clip_construction": clip_meta,
             }
         behavior_results[tid] = behavior_result
 
@@ -289,7 +424,14 @@ def run_integrated(
             "behavior_backend_error": behavior_backend_error,
             "device": "cpu",
         },
-        "outputs": {"annotated_video": str(video_dir / "annotated.mp4"), "tracks": str(video_dir / "tracks.json"), "species": str(species_json), "crops": str(crop_root), "evidence": evidence_uri},
+        "outputs": {
+            "annotated_video": str(video_dir / "annotated.mp4"),
+            "tracks": str(video_dir / "tracks.json"),
+            "species": str(species_json),
+            "crops": str(crop_root),
+            "behavior_clips": str(behavior_root),
+            "evidence": evidence_uri,
+        },
     }
     (output_dir / "pipeline.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
