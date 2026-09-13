@@ -14,6 +14,7 @@ from ml.risk.engine import RiskInput, score_risk
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 DETECTOR_CONFIDENCE = 0.10
+INVALID_SPECIES = {"human", "person", "blank", "no cv result", "mammal", "animal", "vehicle"}
 
 
 def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -23,40 +24,102 @@ def _prediction_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
-def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
+def _detector_evidence(row: dict[str, Any]) -> tuple[float, float]:
+    """Return the strongest SpeciesNet animal and human detector scores."""
+    animal_conf = 0.0
+    human_conf = 0.0
+    detections = row.get("detections")
+    if not isinstance(detections, list):
+        return animal_conf, human_conf
+    for detection in detections:
+        if not isinstance(detection, dict):
+            continue
+        label = str(detection.get("label", "")).strip().lower()
+        try:
+            conf = float(detection.get("conf", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if label == "animal":
+            animal_conf = max(animal_conf, conf)
+        elif label in {"human", "person"}:
+            human_conf = max(human_conf, conf)
+    return animal_conf, human_conf
+
+
+def _leaf_candidates(row: dict[str, Any]) -> list[tuple[str, float]]:
+    """Extract concrete species candidates from SpeciesNet's ranked classes."""
     candidates: list[tuple[str, float]] = []
-    for row in rows:
-        prediction = row.get("prediction")
-        if isinstance(prediction, str) and prediction.strip():
-            parts = [p.strip() for p in prediction.split(";")]
-            name = parts[-1] if len(parts) >= 7 and parts[-1] else (parts[-2] if len(parts) >= 6 and parts[-2] else prediction.strip())
-            try:
-                score = float(row.get("prediction_score", 0.0))
-            except (TypeError, ValueError):
-                score = 0.0
-            candidates.append((name, score))
-
-        for key in ("label", "species", "scientific_name", "common_name"):
-            value = row.get(key)
-            if isinstance(value, str) and value.strip():
+    classifications = row.get("classifications")
+    if isinstance(classifications, dict):
+        classes = classifications.get("classes")
+        scores = classifications.get("scores")
+        if isinstance(classes, list) and isinstance(scores, list):
+            for raw_class, raw_score in zip(classes, scores):
+                if not isinstance(raw_class, str):
+                    continue
+                parts = [p.strip() for p in raw_class.split(";")]
+                if len(parts) < 7:
+                    continue
+                name = parts[-1].strip()
+                if not name:
+                    continue
                 try:
-                    score = float(row.get("prediction_score", row.get("score", row.get("confidence", row.get("probability", 0.0)))))
+                    score = float(raw_score)
                 except (TypeError, ValueError):
-                    score = 0.0
-                candidates.append((value.strip(), score))
+                    continue
+                if name.casefold() in INVALID_SPECIES:
+                    continue
+                candidates.append((name, score))
+    return candidates
 
-        for key in ("classification", "classifications"):
-            value = row.get(key)
-            if isinstance(value, dict):
-                name = value.get("common_name") or value.get("species") or value.get("label") or value.get("class")
-                if isinstance(name, str) and name.strip():
-                    try:
-                        score = float(value.get("prediction_score", value.get("score", value.get("confidence", value.get("probability", 0.0)))))
-                    except (TypeError, ValueError):
-                        score = 0.0
-                    candidates.append((name.strip(), score))
 
-    return max(candidates, key=lambda x: x[1]) if candidates else ("UNKNOWN", 0.0)
+def _best_species(rows: list[dict[str, Any]]) -> tuple[str, float]:
+    """Choose a concrete wildlife species from detector-valid SpeciesNet results.
+
+    SpeciesNet may roll a concrete prediction up to a generic class such as
+    ``mammal`` even while its ranked leaf classes contain ``lion``. It can also
+    return human as the classifier winner for a crop that was originally
+    supplied as an animal track. We therefore use SpeciesNet's own detection
+    evidence to reject human-only crops and aggregate concrete leaf classes.
+    """
+    weighted_scores: dict[str, float] = defaultdict(float)
+    weight_totals: dict[str, float] = defaultdict(float)
+
+    for row in rows:
+        animal_conf, human_conf = _detector_evidence(row)
+        if animal_conf > 0.0:
+            # A crop whose own detector sees a human more strongly than an
+            # animal is not reliable evidence for the animal track.
+            if human_conf > animal_conf * 0.9:
+                continue
+            evidence_weight = max(animal_conf, 0.05)
+        else:
+            # Rows without detector metadata are retained only when their
+            # prediction is already a concrete non-human wildlife species.
+            prediction = row.get("prediction")
+            if not isinstance(prediction, str):
+                continue
+            parts = [p.strip() for p in prediction.split(";")]
+            leaf = parts[-1] if len(parts) >= 7 else ""
+            if not leaf or leaf.casefold() in INVALID_SPECIES:
+                continue
+            evidence_weight = 0.25
+
+        for name, score in _leaf_candidates(row):
+            weighted_scores[name] += score * evidence_weight
+            weight_totals[name] += evidence_weight
+
+    if not weighted_scores:
+        return "UNKNOWN", 0.0
+
+    ranked = sorted(
+        weighted_scores.items(),
+        key=lambda item: item[1] / max(weight_totals[item[0]], 1e-9),
+        reverse=True,
+    )
+    name = ranked[0][0]
+    confidence = weighted_scores[name] / max(weight_totals[name], 1e-9)
+    return name, float(confidence)
 
 
 def extract_track_crops(video: Path, tracks: list[dict[str, Any]], crop_root: Path, per_track: int = 16) -> dict[str, list[Path]]:
@@ -162,6 +225,15 @@ def run_integrated(
             "sample_count": len(paths),
             "classified_count": len(matching),
         }
+
+    # Put concrete wildlife tracks before unknown/generic/human outputs so the
+    # dashboard's primary species card reflects the strongest wildlife evidence.
+    def _species_priority(item: tuple[str, dict[str, Any]]) -> tuple[int, float]:
+        species = str(item[1].get("species", "UNKNOWN")).casefold()
+        concrete = int(species not in {"unknown", "human", "person", "blank", "no cv result", "mammal", "animal", "vehicle"})
+        return concrete, float(item[1].get("confidence", 0.0))
+
+    track_species = dict(sorted(track_species.items(), key=_species_priority, reverse=True))
 
     from ml.behavior import BehaviorMapper, VideoMAEBehaviorClassifier
     behavior_model = VideoMAEBehaviorClassifier(behavior_checkpoint, device="cpu")
