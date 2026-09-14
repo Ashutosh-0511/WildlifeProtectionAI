@@ -6,7 +6,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from google import genai
+
+load_dotenv()
 
 PRIMARY_MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
@@ -197,10 +200,6 @@ def analyze_video(
                 return data
             except Exception as exc:
                 last_error = exc
-                # Any failure of the current model moves to the next model in
-                # the configured chain. This is intentional: capacity errors,
-                # transient failures, and model-specific feature failures all
-                # get a chance to recover on the next stable Flash endpoint.
                 if index < len(requested_chain) - 1:
                     time.sleep(2)
                     continue
