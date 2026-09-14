@@ -11,7 +11,6 @@ from google import genai
 PRIMARY_MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
 DEFAULT_MODEL_CHAIN = (PRIMARY_MODEL, *FALLBACK_MODELS)
-RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class AnalysisUnavailableError(RuntimeError):
@@ -117,23 +116,6 @@ def _client(api_key: str | None = None) -> genai.Client:
     return genai.Client(api_key=key)
 
 
-def _status_code(exc: BaseException) -> int | None:
-    value = getattr(exc, "status_code", None)
-    if value is None:
-        value = getattr(exc, "code", None)
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    status = _status_code(exc)
-    if status in RETRYABLE_STATUS_CODES:
-        return True
-    return isinstance(exc, (TimeoutError, ConnectionError))
-
-
 def _generate_for_model(
     client: genai.Client,
     model_name: str,
@@ -215,13 +197,16 @@ def analyze_video(
                 return data
             except Exception as exc:
                 last_error = exc
-                if model is not None or not _is_retryable(exc):
-                    raise
+                # Any failure of the current model moves to the next model in
+                # the configured chain. This is intentional: capacity errors,
+                # transient failures, and model-specific feature failures all
+                # get a chance to recover on the next stable Flash endpoint.
                 if index < len(requested_chain) - 1:
-                    # Brief pause before switching to the next configured model.
                     time.sleep(2)
+                    continue
+                raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
 
-        raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
+        raise AnalysisUnavailableError("No configured analysis model completed the request") from last_error
     finally:
         try:
             client.files.delete(name=uploaded.name)
