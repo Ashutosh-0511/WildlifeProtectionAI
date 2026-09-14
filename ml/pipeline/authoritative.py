@@ -19,57 +19,79 @@ def _normalize_behavior_name(value: Any) -> str:
     return name or "UNKNOWN"
 
 
+def _unavailable_analysis(video: Path, output_path: Path) -> dict[str, Any]:
+    """Return a safe empty analysis when all configured providers are unavailable."""
+    data: dict[str, Any] = {
+        "status": "unavailable",
+        "species": [],
+        "primary_species": "UNKNOWN",
+        "behaviors": [],
+        "primary_behavior": "UNKNOWN",
+        "behavior_confidence": 0.0,
+        "human_present": False,
+        "risk_score": 1,
+        "risk_level": "UNKNOWN",
+        "risk_reasoning": "No authoritative video analysis was available.",
+        "action_recommendation": "Review the video manually before making a safety decision.",
+        "uncertainty": "Analysis service unavailable.",
+        "model": None,
+        "source": "gemini_video",
+        "video_file": video.name,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data
+
+
 def _dashboard_result(
-    gemini: dict[str, Any],
+    analysis: dict[str, Any],
     local_result: dict[str, Any] | None,
     video: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
-    primary_species = _normalize_species_name(gemini.get("primary_species"))
-    primary_behavior = _normalize_behavior_name(gemini.get("primary_behavior"))
-    try:
-        species_confidence = float(gemini.get("behavior_confidence", 0.0))
-    except (TypeError, ValueError):
-        species_confidence = 0.0
-
-    species_items = gemini.get("species")
-    if isinstance(species_items, list) and species_items:
-        first = species_items[0]
-        if isinstance(first, dict) and _normalize_species_name(first.get("name")).casefold() == primary_species.casefold():
-            try:
-                species_confidence = float(first.get("confidence", species_confidence))
-            except (TypeError, ValueError):
-                pass
+    primary_species = _normalize_species_name(analysis.get("primary_species"))
+    primary_behavior = _normalize_behavior_name(analysis.get("primary_behavior"))
 
     try:
-        behavior_confidence = float(gemini.get("behavior_confidence", 0.0))
+        behavior_confidence = float(analysis.get("behavior_confidence", 0.0))
     except (TypeError, ValueError):
         behavior_confidence = 0.0
     behavior_confidence = max(0.0, min(1.0, behavior_confidence))
+
+    species_confidence = 0.0
+    species_items = analysis.get("species")
+    if isinstance(species_items, list):
+        for item in species_items:
+            if not isinstance(item, dict):
+                continue
+            if _normalize_species_name(item.get("name")).casefold() == primary_species.casefold():
+                try:
+                    species_confidence = float(item.get("confidence", 0.0))
+                except (TypeError, ValueError):
+                    species_confidence = 0.0
+                break
     species_confidence = max(0.0, min(1.0, species_confidence))
 
     try:
-        risk_score_10 = int(gemini.get("risk_score", 1))
+        risk_score_10 = int(analysis.get("risk_score", 1))
     except (TypeError, ValueError):
         risk_score_10 = 1
     risk_score_10 = max(1, min(10, risk_score_10))
-    risk_level = str(gemini.get("risk_level", "UNKNOWN")).strip().upper() or "UNKNOWN"
+    risk_level = str(analysis.get("risk_level", "UNKNOWN")).strip().upper() or "UNKNOWN"
     if risk_level not in {"LOW", "MEDIUM", "HIGH", "CRITICAL", "UNKNOWN"}:
         risk_level = "UNKNOWN"
 
-    human_present = bool(gemini.get("human_present", False))
-    reasoning = str(gemini.get("risk_reasoning", "")).strip()
-    recommendation = str(gemini.get("action_recommendation", "")).strip()
-    uncertainty = str(gemini.get("uncertainty", "")).strip()
+    human_present = bool(analysis.get("human_present", False))
+    reasoning = str(analysis.get("risk_reasoning", "")).strip()
+    recommendation = str(analysis.get("action_recommendation", "")).strip()
+    uncertainty = str(analysis.get("uncertainty", "")).strip()
 
     risk = {
-        # Preserve the existing risk-engine score range while retaining Gemini's
-        # original 1-10 score for the dashboard adapter and audit trail.
         "risk_score": round(risk_score_10 / 10.0, 4),
         "risk_level": risk_level,
         "gemini_risk_score": risk_score_10,
         "factors": [
-            {"name": "human_presence", "value": human_present, "contribution": "Observed by video model"},
+            {"name": "human_presence", "value": human_present, "contribution": "Observed in video"},
             {"name": "risk_reasoning", "value": reasoning, "contribution": reasoning or "Not provided"},
             {"name": "action_recommendation", "value": recommendation, "contribution": recommendation or "Not provided"},
             {"name": "uncertainty", "value": uncertainty, "contribution": uncertainty or "Not provided"},
@@ -79,15 +101,17 @@ def _dashboard_result(
         "uncertainty": uncertainty,
     }
 
-    # Keep the existing dashboard response shape. The single authoritative
-    # subject represents Gemini's primary wildlife subject for the uploaded clip.
+    successful = str(analysis.get("status", "success")).lower() == "success"
+    has_subject = successful and primary_species != "UNKNOWN"
+    model_version = analysis.get("model") or "unknown"
+
     behavior_entry = {
         "behaviour": primary_behavior,
         "behavior_class": primary_behavior.upper().replace(" ", "_"),
         "confidence": behavior_confidence,
         "frames": 0,
-        "model_version": gemini.get("model", "gemini-3.6-flash"),
-        "behavior_timeline": gemini.get("behaviors", []),
+        "model_version": model_version,
+        "behavior_timeline": analysis.get("behaviors", []),
         "source": "gemini_video",
     }
     species_entry = {
@@ -98,7 +122,7 @@ def _dashboard_result(
         "source": "gemini_video",
     }
     risk_event = {
-        "risk_event_id": f"gemini-{video.stem}",
+        "risk_event_id": f"video-{video.stem}",
         "track_id": "1",
         "species": primary_species,
         "behaviour": primary_behavior,
@@ -117,24 +141,22 @@ def _dashboard_result(
     if local_result is not None:
         local_pipeline_path.write_text(json.dumps(local_result, indent=2), encoding="utf-8")
 
-    # The dashboard-visible tracking count is deliberately derived from the
-    # authoritative Gemini result, not from local detection/tracking output.
     summary = dict(local_summary) if isinstance(local_summary, dict) else {}
-    summary["unique_track_ids"] = ["1"] if primary_species != "UNKNOWN" else []
-    summary["track_observation_count"] = 1 if primary_species != "UNKNOWN" else 0
-    summary["detection_count"] = 1 if primary_species != "UNKNOWN" else 0
+    summary["unique_track_ids"] = ["1"] if has_subject else []
+    summary["track_observation_count"] = 1 if has_subject else 0
+    summary["detection_count"] = 1 if has_subject else 0
 
     result = {
         "input": str(video),
         "summary": summary,
-        "species": {"1": species_entry} if primary_species != "UNKNOWN" else {},
-        "behavior": {"1": behavior_entry} if primary_species != "UNKNOWN" else {},
-        "risk_events": [risk_event] if primary_species != "UNKNOWN" else [],
+        "species": {"1": species_entry} if has_subject else {},
+        "behavior": {"1": behavior_entry} if has_subject else {},
+        "risk_events": [risk_event] if has_subject else [],
         "models": {
             "detector": local_models.get("detector", "MegaDetectorV6 MDV6-yolov9-c"),
             "tracker": local_models.get("tracker", "ByteTrack"),
             "species": local_models.get("species", "SpeciesNet 5.x"),
-            "behavior": gemini.get("model", "gemini-3.6-flash"),
+            "behavior": model_version,
             "behavior_backend_error": None,
             "device": local_models.get("device", "cpu"),
             "authoritative_source": "gemini_video",
@@ -149,7 +171,7 @@ def _dashboard_result(
             "gemini_analysis": str(output_dir / "gemini" / "analysis.json"),
             "local_pipeline": str(local_pipeline_path) if local_result is not None else None,
         },
-        "gemini": gemini,
+        "gemini": analysis,
     }
 
     (output_dir / "pipeline.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -163,16 +185,17 @@ def run_authoritative(
     species_samples: int = 16,
     behavior_checkpoint: str | Path = "models/behavior/videomae/videomae_combined_v1.pt",
 ) -> dict[str, Any]:
-    """Run the existing local pipeline for terminal diagnostics while making the
-    Gemini video analysis the sole authoritative dashboard result.
+    """Run the existing local pipeline for terminal diagnostics while making
+    video-model analysis the sole authoritative dashboard result.
 
-    The local pipeline is started in a worker immediately so its existing model
-    loading/inference output remains visible in the backend terminal. No provider
-    or cloud-model status is printed by this orchestration layer.
+    The local pipeline is started immediately in a worker so all of its existing
+    model-loading and inference output remains visible in the backend terminal.
+    The cloud-analysis branch is intentionally silent; no provider/model status
+    is printed to stdout or stderr by this orchestration layer.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    gemini_dir = output_dir / "gemini"
-    gemini_dir.mkdir(parents=True, exist_ok=True)
+    analysis_path = output_dir / "gemini" / "analysis.json"
+    analysis_path.parent.mkdir(parents=True, exist_ok=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-diagnostics") as executor:
         local_future = executor.submit(
@@ -184,19 +207,18 @@ def run_authoritative(
             behavior_checkpoint,
         )
 
-        # Run the authoritative video analysis in the request thread. This keeps
-        # its lifecycle simple while local model work continues independently.
-        gemini_result = analyze_video(
-            video,
-            output_path=gemini_dir / "analysis.json",
-        )
+        try:
+            analysis = analyze_video(video, output_path=analysis_path)
+        except Exception:
+            # Never print provider/model errors to the terminal. The dashboard
+            # receives a safe UNKNOWN result instead of falling back to a local
+            # behaviour classifier.
+            analysis = _unavailable_analysis(video, analysis_path)
 
-        local_result: dict[str, Any] | None
         try:
             local_result = local_future.result()
-        except Exception:
-            # Local diagnostics must never replace or contaminate the authoritative
-            # result. Preserve the exception semantics by returning the Gemini result.
+        except Exception as exc:
+            print(f"WARNING: local diagnostic pipeline failed: {type(exc).__name__}: {exc}")
             local_result = None
 
-    return _dashboard_result(gemini_result, local_result, video, output_dir)
+    return _dashboard_result(analysis, local_result, video, output_dir)
