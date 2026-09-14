@@ -14,6 +14,11 @@ FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
 DEFAULT_MODEL_CHAIN = (PRIMARY_MODEL, *FALLBACK_MODELS)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+
+class AnalysisUnavailableError(RuntimeError):
+    """Raised only when the configured model chain cannot serve the request."""
+
+
 GEMINI_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -170,7 +175,6 @@ def analyze_video(
     requested_chain = (model,) if model else DEFAULT_MODEL_CHAIN
 
     uploaded = client.files.upload(file=str(path))
-    selected_model: str | None = None
     last_error: BaseException | None = None
     deadline = time.monotonic() + timeout_seconds
 
@@ -180,19 +184,18 @@ def analyze_video(
             if state == "ACTIVE":
                 break
             if state == "FAILED":
-                raise RuntimeError("Video processing failed after upload")
+                raise AnalysisUnavailableError("Video processing was unavailable")
             if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for video processing after upload")
+                raise AnalysisUnavailableError("Timed out waiting for video processing")
             time.sleep(2)
             uploaded = client.files.get(name=uploaded.name)
 
         for model_name in requested_chain:
             if time.monotonic() >= deadline:
-                raise TimeoutError("Gemini analysis timed out before a model completed")
+                raise AnalysisUnavailableError("Analysis timed out before a model completed") from last_error
             try:
                 data = _generate_for_model(client, model_name, uploaded)
-                selected_model = model_name
-                data["model"] = selected_model
+                data["model"] = model_name
                 data["source"] = "gemini_video"
                 data["video_file"] = path.name
                 data["generated_at_epoch"] = time.time()
@@ -205,11 +208,9 @@ def analyze_video(
                 last_error = exc
                 if model is not None or not _is_retryable(exc):
                     raise
-                # Give transient capacity/rate-limit failures a brief recovery window
-                # before the next model in the chain, without emitting provider details.
                 time.sleep(2)
 
-        raise RuntimeError("No configured model completed the analysis") from last_error
+        raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
     finally:
         try:
             client.files.delete(name=uploaded.name)
