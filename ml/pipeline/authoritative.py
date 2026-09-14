@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ml.behavior.gemini_video import AnalysisUnavailableError, analyze_video
+from ml.behavior.gemini_video import analyze_video
 from ml.pipeline.integrated import run_integrated
 
 
@@ -200,7 +200,9 @@ def run_authoritative(
 
         try:
             analysis = analyze_video(video, output_path=analysis_path)
-        except AnalysisUnavailableError:
+        except Exception:
+            # Cloud analysis is deliberately silent. A complete failure becomes an
+            # explicit UNKNOWN dashboard result rather than a local-model fallback.
             analysis = _unavailable_analysis(video, analysis_path)
 
         try:
