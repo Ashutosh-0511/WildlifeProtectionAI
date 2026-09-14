@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ml.behavior.gemini_video import analyze_video
+from ml.behavior.gemini_video import AnalysisUnavailableError, analyze_video
 from ml.pipeline.integrated import run_integrated
 
 
@@ -20,7 +20,6 @@ def _normalize_behavior_name(value: Any) -> str:
 
 
 def _unavailable_analysis(video: Path, output_path: Path) -> dict[str, Any]:
-    """Return a safe empty analysis when all configured providers are unavailable."""
     data: dict[str, Any] = {
         "status": "unavailable",
         "species": [],
@@ -185,14 +184,6 @@ def run_authoritative(
     species_samples: int = 16,
     behavior_checkpoint: str | Path = "models/behavior/videomae/videomae_combined_v1.pt",
 ) -> dict[str, Any]:
-    """Run the existing local pipeline for terminal diagnostics while making
-    video-model analysis the sole authoritative dashboard result.
-
-    The local pipeline is started immediately in a worker so all of its existing
-    model-loading and inference output remains visible in the backend terminal.
-    The cloud-analysis branch is intentionally silent; no provider/model status
-    is printed to stdout or stderr by this orchestration layer.
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = output_dir / "gemini" / "analysis.json"
     analysis_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,10 +200,7 @@ def run_authoritative(
 
         try:
             analysis = analyze_video(video, output_path=analysis_path)
-        except Exception:
-            # Never print provider/model errors to the terminal. The dashboard
-            # receives a safe UNKNOWN result instead of falling back to a local
-            # behaviour classifier.
+        except AnalysisUnavailableError:
             analysis = _unavailable_analysis(video, analysis_path)
 
         try:
