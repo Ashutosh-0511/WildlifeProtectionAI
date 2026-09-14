@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from ml.behavior.gemini_video import AnalysisUnavailableError
 from ml.pipeline.authoritative import run_authoritative
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,9 +77,13 @@ async def inference_video(file: UploadFile = File(...)):
     job_id = str(uuid4())
     input_path = UPLOAD_DIR / f"{job_id}{suffix}"
     job_dir = OUTPUT_DIR / job_id
+    job_video_dir = job_dir / "video"
+    job_video_dir.mkdir(parents=True, exist_ok=True)
+    browser_input_path = job_video_dir / f"input{suffix}"
 
     with input_path.open("wb") as destination:
         shutil.copyfileobj(file.file, destination)
+    shutil.copy2(input_path, browser_input_path)
 
     try:
         result = run_authoritative(
@@ -88,10 +93,12 @@ async def inference_video(file: UploadFile = File(...)):
             species_samples=16,
             behavior_checkpoint=CHECKPOINT,
         )
+    except AnalysisUnavailableError:
+        # Keep provider details out of the terminal. The browser receives a
+        # neutral retryable service error instead of a fake UNKNOWN result.
+        raise HTTPException(503, "Video analysis is temporarily unavailable. Please try again.")
     except Exception as exc:
-        # Keep the browser response concise but always print the complete
-        # traceback to the Uvicorn console so pipeline failures can be fixed
-        # from the actual failing stage rather than a generic 500 response.
+        # Keep unexpected local pipeline failures diagnosable in the backend.
         traceback.print_exc()
         raise HTTPException(
             500,
@@ -104,10 +111,15 @@ async def inference_video(file: UploadFile = File(...)):
     result["created_at"] = datetime.now(timezone.utc).isoformat()
     annotated = result.get("outputs", {}).get("annotated_video")
     evidence = result.get("outputs", {}).get("evidence")
+
+    # Preserve the existing dashboard video panel even if local annotation did
+    # not finish: the uploaded source video remains available as evidence.
     if annotated and Path(annotated).exists():
         result["outputs"]["annotated_video_url"] = f"/outputs/{job_id}/video/annotated.mp4"
     else:
-        result["outputs"]["annotated_video_url"] = None
+        result["outputs"]["annotated_video"] = str(browser_input_path)
+        result["outputs"]["annotated_video_url"] = f"/outputs/{job_id}/video/input{suffix}"
+
     if evidence and Path(evidence).exists():
         result["outputs"]["evidence_url"] = f"/outputs/{job_id}/evidence.jpg"
     else:
@@ -161,7 +173,7 @@ button:disabled{opacity:.5;cursor:wait}
 table{width:100%;border-collapse:collapse;margin-top:10px}td,th{padding:10px;text-align:left;border-bottom:1px solid #20352a;font-size:13px}
 .factor{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #1b2d24;color:#b6c9bd}
 .hidden{display:none}.error{color:#ff9696}
-@media(max-width:800px){.grid,.results{grid-template-columns:1fr 1fr}.results{grid-template-columns:1fr}} 
+@media(max-width:800px){.grid,.results{grid-template-columns:1fr 1fr}.results{grid-template-columns:1fr}}
 </style>
 </head>
 <body>

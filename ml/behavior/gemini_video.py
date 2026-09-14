@@ -7,16 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from google import genai
-from google.genai import types
 
 PRIMARY_MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
 DEFAULT_MODEL_CHAIN = (PRIMARY_MODEL, *FALLBACK_MODELS)
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class AnalysisUnavailableError(RuntimeError):
-    """Raised only when the configured model chain cannot serve the request."""
+    """Raised when the configured analysis model chain cannot serve the request."""
 
 
 GEMINI_SCHEMA: dict[str, Any] = {
@@ -118,38 +116,30 @@ def _client(api_key: str | None = None) -> genai.Client:
     return genai.Client(api_key=key)
 
 
-def _status_code(exc: BaseException) -> int | None:
-    value = getattr(exc, "status_code", None)
-    if value is None:
-        value = getattr(exc, "code", None)
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    status = _status_code(exc)
-    if status in RETRYABLE_STATUS_CODES:
-        return True
-    return isinstance(exc, (TimeoutError, ConnectionError))
-
-
 def _generate_for_model(
     client: genai.Client,
     model_name: str,
     uploaded: Any,
 ) -> dict[str, Any]:
-    response = client.models.generate_content(
+    """Use the current Interactions API video path with agentic processing."""
+    interaction = client.interactions.create(
         model=model_name,
-        contents=[uploaded, PROMPT],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=GEMINI_SCHEMA,
-            temperature=0.2,
-        ),
+        input=[
+            {
+                "type": "video",
+                "uri": uploaded.uri,
+                "mime_type": uploaded.mime_type or "video/mp4",
+                "processing": "agentic",
+            },
+            {"type": "text", "text": PROMPT},
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GEMINI_SCHEMA,
+        },
     )
-    text = (response.text or "").strip()
+    text = (getattr(interaction, "output_text", None) or "").strip()
     if not text:
         raise RuntimeError("Model returned an empty response")
     data = json.loads(text)
@@ -164,7 +154,7 @@ def analyze_video(
     *,
     api_key: str | None = None,
     model: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 900,
 ) -> dict[str, Any]:
     """Analyze a video using the requested model or the configured fallback chain."""
     path = Path(video_path)
@@ -190,13 +180,14 @@ def analyze_video(
             time.sleep(2)
             uploaded = client.files.get(name=uploaded.name)
 
-        for model_name in requested_chain:
+        for index, model_name in enumerate(requested_chain):
             if time.monotonic() >= deadline:
                 raise AnalysisUnavailableError("Analysis timed out before a model completed") from last_error
             try:
                 data = _generate_for_model(client, model_name, uploaded)
+                data["status"] = "success"
                 data["model"] = model_name
-                data["source"] = "gemini_video"
+                data["source"] = "video_analysis"
                 data["video_file"] = path.name
                 data["generated_at_epoch"] = time.time()
                 if output_path is not None:
@@ -206,11 +197,16 @@ def analyze_video(
                 return data
             except Exception as exc:
                 last_error = exc
-                if model is not None or not _is_retryable(exc):
-                    raise
-                time.sleep(2)
+                # Any failure of the current model moves to the next model in
+                # the configured chain. This is intentional: capacity errors,
+                # transient failures, and model-specific feature failures all
+                # get a chance to recover on the next stable Flash endpoint.
+                if index < len(requested_chain) - 1:
+                    time.sleep(2)
+                    continue
+                raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
 
-        raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
+        raise AnalysisUnavailableError("No configured analysis model completed the request") from last_error
     finally:
         try:
             client.files.delete(name=uploaded.name)
