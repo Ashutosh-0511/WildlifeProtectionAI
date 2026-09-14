@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ml.behavior.gemini_video import analyze_video
+from ml.behavior.gemini_video import AnalysisUnavailableError, analyze_video
 from ml.pipeline.integrated import run_integrated
 
 
@@ -17,29 +17,6 @@ def _normalize_species_name(value: Any) -> str:
 def _normalize_behavior_name(value: Any) -> str:
     name = str(value or "UNKNOWN").strip()
     return name or "UNKNOWN"
-
-
-def _unavailable_analysis(video: Path, output_path: Path) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "status": "unavailable",
-        "species": [],
-        "primary_species": "UNKNOWN",
-        "behaviors": [],
-        "primary_behavior": "UNKNOWN",
-        "behavior_confidence": 0.0,
-        "human_present": False,
-        "risk_score": 1,
-        "risk_level": "UNKNOWN",
-        "risk_reasoning": "No authoritative video analysis was available.",
-        "action_recommendation": "Review the video manually before making a safety decision.",
-        "uncertainty": "Analysis service unavailable.",
-        "model": None,
-        "source": "gemini_video",
-        "video_file": video.name,
-    }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return data
 
 
 def _dashboard_result(
@@ -111,14 +88,14 @@ def _dashboard_result(
         "frames": 0,
         "model_version": model_version,
         "behavior_timeline": analysis.get("behaviors", []),
-        "source": "gemini_video",
+        "source": "video_analysis",
     }
     species_entry = {
         "species": primary_species,
         "confidence": species_confidence,
         "sample_count": 0,
         "classified_count": 0,
-        "source": "gemini_video",
+        "source": "video_analysis",
     }
     risk_event = {
         "risk_event_id": f"video-{video.stem}",
@@ -129,7 +106,7 @@ def _dashboard_result(
         "human_present": human_present,
         "risk": risk,
         "evidence_uri": None,
-        "source": "gemini_video",
+        "source": "video_analysis",
     }
 
     local_summary = local_result.get("summary", {}) if isinstance(local_result, dict) else {}
@@ -158,7 +135,7 @@ def _dashboard_result(
             "behavior": model_version,
             "behavior_backend_error": None,
             "device": local_models.get("device", "cpu"),
-            "authoritative_source": "gemini_video",
+            "authoritative_source": "video_analysis",
         },
         "outputs": {
             "annotated_video": local_outputs.get("annotated_video"),
@@ -184,6 +161,7 @@ def run_authoritative(
     species_samples: int = 16,
     behavior_checkpoint: str | Path = "models/behavior/videomae/videomae_combined_v1.pt",
 ) -> dict[str, Any]:
+    """Run local diagnostics while making video-model output authoritative."""
     output_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = output_dir / "gemini" / "analysis.json"
     analysis_path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,10 +178,14 @@ def run_authoritative(
 
         try:
             analysis = analyze_video(video, output_path=analysis_path)
-        except Exception:
-            # Cloud analysis is deliberately silent. A complete failure becomes an
-            # explicit UNKNOWN dashboard result rather than a local-model fallback.
-            analysis = _unavailable_analysis(video, analysis_path)
+        except AnalysisUnavailableError:
+            # Keep provider details out of the terminal. The API turns this into
+            # a clean service-unavailable response rather than a fake UNKNOWN run.
+            try:
+                local_future.result()
+            except Exception as exc:
+                print(f"WARNING: local diagnostic pipeline failed: {type(exc).__name__}: {exc}")
+            raise
 
         try:
             local_result = local_future.result()
