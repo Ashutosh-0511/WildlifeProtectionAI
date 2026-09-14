@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from ml.pipeline.integrated import run_integrated
+from ml.pipeline.authoritative import run_authoritative
 
 ROOT = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = ROOT / "data" / "uploads"
@@ -80,11 +80,8 @@ async def inference_video(file: UploadFile = File(...)):
     with input_path.open("wb") as destination:
         shutil.copyfileobj(file.file, destination)
 
-    if not CHECKPOINT.exists():
-        raise HTTPException(500, f"VideoMAE checkpoint not found: {CHECKPOINT}")
-
     try:
-        result = run_integrated(
+        result = run_authoritative(
             input_path,
             job_dir,
             sample_every=3,
@@ -105,9 +102,16 @@ async def inference_video(file: UploadFile = File(...)):
     result["job_id"] = job_id
     result["filename"] = file.filename
     result["created_at"] = datetime.now(timezone.utc).isoformat()
-    result["outputs"]["annotated_video_url"] = f"/outputs/{job_id}/video/annotated.mp4"
-    if result["outputs"].get("evidence"):
+    annotated = result.get("outputs", {}).get("annotated_video")
+    evidence = result.get("outputs", {}).get("evidence")
+    if annotated and Path(annotated).exists():
+        result["outputs"]["annotated_video_url"] = f"/outputs/{job_id}/video/annotated.mp4"
+    else:
+        result["outputs"]["annotated_video_url"] = None
+    if evidence and Path(evidence).exists():
         result["outputs"]["evidence_url"] = f"/outputs/{job_id}/evidence.jpg"
+    else:
+        result["outputs"]["evidence_url"] = None
 
     for event in result.get("risk_events", []):
         event["job_id"] = job_id
@@ -254,7 +258,7 @@ function render(d){
  document.getElementById('behavior').textContent=primaryBehavior?.behaviour||primaryEvent?.behaviour||'UNKNOWN';
  const level=primaryRisk.risk_level||'UNKNOWN';
  document.getElementById('risk').textContent=level;document.getElementById('risk').className='value '+level;
- document.getElementById('video').src=d.outputs.annotated_video_url;
+ document.getElementById('video').src=d.outputs.annotated_video_url||'';
  if(d.outputs.evidence_url){document.getElementById('evidence').src=d.outputs.evidence_url}
  document.getElementById('confidence').textContent='Behaviour confidence: '+(((primaryBehavior?.confidence??primaryEvent?.behaviour_confidence??0)*100).toFixed(1))+'% • Species confidence: '+((Number(primarySpecies?.confidence||0)*100).toFixed(1))+'%';
  document.getElementById('rows').innerHTML=events.map(e=>'<tr><td>'+esc(e.track_id)+'</td><td>'+esc(e.species)+'</td><td>'+esc(e.behaviour)+'</td><td>'+((e.behaviour_confidence||0)*100).toFixed(1)+'%</td><td class="'+esc(e.risk?.risk_level)+'">'+esc(e.risk?.risk_level)+'</td><td>'+((e.human_present)?'YES':'NO')+'</td></tr>').join('');
