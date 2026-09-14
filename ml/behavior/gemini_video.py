@@ -7,16 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from google import genai
-from google.genai import types
 
 PRIMARY_MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
 DEFAULT_MODEL_CHAIN = (PRIMARY_MODEL, *FALLBACK_MODELS)
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class AnalysisUnavailableError(RuntimeError):
-    """Raised only when the configured model chain cannot serve the request."""
+    """Raised when the configured analysis model chain cannot serve the request."""
 
 
 GEMINI_SCHEMA: dict[str, Any] = {
@@ -140,16 +139,25 @@ def _generate_for_model(
     model_name: str,
     uploaded: Any,
 ) -> dict[str, Any]:
-    response = client.models.generate_content(
+    """Use the current Interactions API video path with agentic processing."""
+    interaction = client.interactions.create(
         model=model_name,
-        contents=[uploaded, PROMPT],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=GEMINI_SCHEMA,
-            temperature=0.2,
-        ),
+        input=[
+            {
+                "type": "video",
+                "uri": uploaded.uri,
+                "mime_type": uploaded.mime_type or "video/mp4",
+                "processing": "agentic",
+            },
+            {"type": "text", "text": PROMPT},
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GEMINI_SCHEMA,
+        },
     )
-    text = (response.text or "").strip()
+    text = (getattr(interaction, "output_text", None) or "").strip()
     if not text:
         raise RuntimeError("Model returned an empty response")
     data = json.loads(text)
@@ -164,7 +172,7 @@ def analyze_video(
     *,
     api_key: str | None = None,
     model: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 900,
 ) -> dict[str, Any]:
     """Analyze a video using the requested model or the configured fallback chain."""
     path = Path(video_path)
@@ -190,13 +198,14 @@ def analyze_video(
             time.sleep(2)
             uploaded = client.files.get(name=uploaded.name)
 
-        for model_name in requested_chain:
+        for index, model_name in enumerate(requested_chain):
             if time.monotonic() >= deadline:
                 raise AnalysisUnavailableError("Analysis timed out before a model completed") from last_error
             try:
                 data = _generate_for_model(client, model_name, uploaded)
+                data["status"] = "success"
                 data["model"] = model_name
-                data["source"] = "gemini_video"
+                data["source"] = "video_analysis"
                 data["video_file"] = path.name
                 data["generated_at_epoch"] = time.time()
                 if output_path is not None:
@@ -208,7 +217,9 @@ def analyze_video(
                 last_error = exc
                 if model is not None or not _is_retryable(exc):
                     raise
-                time.sleep(2)
+                if index < len(requested_chain) - 1:
+                    # Brief pause before switching to the next configured model.
+                    time.sleep(2)
 
         raise AnalysisUnavailableError("All configured analysis models were unavailable") from last_error
     finally:
