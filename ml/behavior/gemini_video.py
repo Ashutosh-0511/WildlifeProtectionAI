@@ -9,7 +9,10 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+PRIMARY_MODEL = "gemini-3.6-flash"
+FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-3.8-flash")
+DEFAULT_MODEL_CHAIN = (PRIMARY_MODEL, *FALLBACK_MODELS)
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 GEMINI_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -105,9 +108,49 @@ def _client(api_key: str | None = None) -> genai.Client:
     key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError(
-            "GEMINI_API_KEY is not set. Set it as an environment variable before running Gemini analysis."
+            "GEMINI_API_KEY is not set. Set it as an environment variable before running analysis."
         )
     return genai.Client(api_key=key)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if value is None:
+        value = getattr(exc, "code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    status = _status_code(exc)
+    if status in RETRYABLE_STATUS_CODES:
+        return True
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+def _generate_for_model(
+    client: genai.Client,
+    model_name: str,
+    uploaded: Any,
+) -> dict[str, Any]:
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[uploaded, PROMPT],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GEMINI_SCHEMA,
+            temperature=0.2,
+        ),
+    )
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Model returned an empty response")
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Model response was not a JSON object")
+    return data
 
 
 def analyze_video(
@@ -118,59 +161,57 @@ def analyze_video(
     model: str | None = None,
     timeout_seconds: int = 600,
 ) -> dict[str, Any]:
-    """Upload a local video to Gemini and return a validated structured analysis."""
+    """Analyze a video using the requested model or the configured fallback chain."""
     path = Path(video_path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"Video not found: {path}")
 
     client = _client(api_key)
-    model_name = model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
+    requested_chain = (model,) if model else DEFAULT_MODEL_CHAIN
 
     uploaded = client.files.upload(file=str(path))
+    selected_model: str | None = None
+    last_error: BaseException | None = None
+    deadline = time.monotonic() + timeout_seconds
+
     try:
-        deadline = time.monotonic() + timeout_seconds
         while True:
             state = getattr(uploaded.state, "name", str(uploaded.state))
             if state == "ACTIVE":
                 break
             if state == "FAILED":
-                raise RuntimeError("Gemini video processing failed after upload")
+                raise RuntimeError("Video processing failed after upload")
             if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for Gemini to finish processing the uploaded video")
+                raise TimeoutError("Timed out waiting for video processing after upload")
             time.sleep(2)
             uploaded = client.files.get(name=uploaded.name)
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[uploaded, PROMPT],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=GEMINI_SCHEMA,
-                temperature=0.2,
-            ),
-        )
+        for model_name in requested_chain:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Gemini analysis timed out before a model completed")
+            try:
+                data = _generate_for_model(client, model_name, uploaded)
+                selected_model = model_name
+                data["model"] = selected_model
+                data["source"] = "gemini_video"
+                data["video_file"] = path.name
+                data["generated_at_epoch"] = time.time()
+                if output_path is not None:
+                    out = Path(output_path)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                return data
+            except Exception as exc:
+                last_error = exc
+                if model is not None or not _is_retryable(exc):
+                    raise
+                # Give transient capacity/rate-limit failures a brief recovery window
+                # before the next model in the chain, without emitting provider details.
+                time.sleep(2)
 
-        text = (response.text or "").strip()
-        if not text:
-            raise RuntimeError("Gemini returned an empty response")
-
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("Gemini response was not a JSON object")
-
-        # Defensive normalization for dashboard stability.
-        data["model"] = model_name
-        data["source"] = "gemini_video"
-        data["video_file"] = path.name
-        data["generated_at_epoch"] = time.time()
-        if output_path is not None:
-            out = Path(output_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return data
+        raise RuntimeError("No configured model completed the analysis") from last_error
     finally:
         try:
             client.files.delete(name=uploaded.name)
         except Exception:
-            # Cleanup failure should never erase a valid model response.
             pass
