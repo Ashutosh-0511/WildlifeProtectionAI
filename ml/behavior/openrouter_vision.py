@@ -160,6 +160,7 @@ def analyze_video(
         "messages": [{"role": "user", "content": content}],
         "temperature": 0.1,
         "max_tokens": 1600,
+        "response_format": {"type": "json_object"},
     }
 
     try:
