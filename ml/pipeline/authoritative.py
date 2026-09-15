@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ml.behavior.gemini_video import AnalysisUnavailableError, analyze_video
+from ml.behavior.gemini_video import AnalysisUnavailableError
+from ml.behavior.vlm_fallback import analyze_video_with_fallbacks
 from ml.pipeline.integrated import run_integrated
 
 
@@ -161,7 +162,7 @@ def run_authoritative(
     species_samples: int = 16,
     behavior_checkpoint: str | Path = "models/behavior/videomae/videomae_combined_v1.pt",
 ) -> dict[str, Any]:
-    """Run local diagnostics while making video-model output authoritative."""
+    """Run local diagnostics while making the VLM chain authoritative."""
     output_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = output_dir / "gemini" / "analysis.json"
     analysis_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +178,7 @@ def run_authoritative(
         )
 
         try:
-            analysis = analyze_video(video, output_path=analysis_path)
+            analysis = analyze_video_with_fallbacks(video, output_path=analysis_path)
         except AnalysisUnavailableError:
             # Keep provider details out of the terminal. The API turns this into
             # a clean service-unavailable response rather than a fake UNKNOWN run.
