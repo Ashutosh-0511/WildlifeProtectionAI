@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ml.behavior.gemini_video import AnalysisUnavailableError, analyze_video as analyze_with_gemini
-from ml.behavior.openrouter_vision import analyze_video as analyze_with_openrouter
+from ml.behavior.groq_vision import analyze_video as analyze_with_groq
 
 
 def analyze_video_with_fallbacks(
@@ -13,7 +13,7 @@ def analyze_video_with_fallbacks(
     *,
     timeout_seconds: int = 900,
 ) -> dict[str, Any]:
-    """Run Gemini 3.6 -> 3.7 -> 3.8, then OpenRouter as the final fallback."""
+    """Run Gemini 3.6 -> 3.7 -> 3.8, then Groq Cloud vision as the final fallback."""
     try:
         return analyze_with_gemini(
             video_path,
@@ -24,7 +24,7 @@ def analyze_video_with_fallbacks(
         pass
 
     try:
-        return analyze_with_openrouter(
+        return analyze_with_groq(
             video_path,
             output_path=output_path,
             timeout_seconds=timeout_seconds,
