@@ -107,6 +107,11 @@ Your tasks:
 Return ONLY the requested JSON object. Confidence values must be in [0,1].
 risk_score must be an integer from 1 to 10. risk_level must be LOW, MEDIUM, HIGH,
 or CRITICAL.
+
+Return ONLY one valid JSON object.
+Do not include Markdown.
+Do not include code fences.
+Do not include any explanation before or after the JSON.
 """.strip()
 
 
